@@ -1,0 +1,224 @@
+{
+  "format_version": 2,
+  "name": "Review loop",
+  "workspace": "",
+  "additional_folders": [],
+  "nodes": [
+    {
+      "id": "af6de005f8634218a4c273eb2e640302",
+      "kind": "entry",
+      "title": "Entry prompt",
+      "x": -640,
+      "y": -30,
+      "config": {
+        "text": "Опишіть, що потрібно зробити",
+        "json": {},
+        "attachments": []
+      }
+    },
+    {
+      "id": "da806461a6484af1946608daf6373d56",
+      "kind": "prompt_reviewer",
+      "title": "Prompt Reviewer",
+      "x": -370,
+      "y": -30,
+      "config": {
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "medium",
+        "instructions": "Ти покращуєш вхідний промпт перед тим, як його виконає інший агент. Врахуй, через які блоки пройде задача далі, і зроби промпт однозначним, перевірюваним і достатнім для виконання.",
+        "instruction_files": [],
+        "prompt": "# Промпт користувача\n{{entry_prompt}}\n\n# Ланцюг блоків, які працюватимуть далі\n{{flow_chain}}\n\nПоверни покращений промпт і перелік того, що ти змінив.",
+        "prompt_source": "template",
+        "sandbox": "read-only",
+        "workspace": "",
+        "additional_folders": [],
+        "output_format": "json",
+        "output_schema": {
+          "improved_prompt": "string",
+          "notes": [
+            "string"
+          ]
+        },
+        "attachments": [],
+        "timeout_seconds": 1800,
+        "retries": 0,
+        "memory": "thread"
+      }
+    },
+    {
+      "id": "aee5897199834abcbf589cd238e9a536",
+      "kind": "executor",
+      "title": "Task Executor",
+      "x": -100,
+      "y": -30,
+      "config": {
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "medium",
+        "instructions": "Виконай поставлену задачу повністю. Якщо тобі повертають задачу на переробку, виправ саме те, що вказав рев'ювер, і не зламай решту.",
+        "instruction_files": [],
+        "prompt": "{{prompt}}",
+        "prompt_source": "input",
+        "sandbox": "workspace-write",
+        "workspace": "",
+        "additional_folders": [],
+        "output_format": "text",
+        "output_schema": {},
+        "attachments": [],
+        "timeout_seconds": 1800,
+        "retries": 0,
+        "memory": "thread"
+      }
+    },
+    {
+      "id": "53dfd7097447473697423a2e89194898",
+      "kind": "task_reviewer",
+      "title": "Task Reviewer",
+      "x": 170,
+      "y": -30,
+      "config": {
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "medium",
+        "instructions": "Ти перевіряєш, чи виконана робота задовольняє поставленій задачі. Будь конкретним: якщо відхиляєш, must_fix має містити дії, а не загальні побажання.",
+        "instruction_files": [],
+        "prompt": "# Задача, відносно якої перевіряємо\n{{criteria}}\n\n# Результат виконавця\n{{work}}\n\nВинеси вердикт за схемою відповіді.",
+        "prompt_source": "template",
+        "sandbox": "read-only",
+        "workspace": "",
+        "additional_folders": [],
+        "output_format": "json",
+        "output_schema": {
+          "verdict": true,
+          "score": 0,
+          "reason": "string",
+          "must_fix": [
+            "string"
+          ]
+        },
+        "attachments": [],
+        "timeout_seconds": 1800,
+        "retries": 0,
+        "memory": "thread",
+        "criteria_node": ""
+      }
+    },
+    {
+      "id": "62a75cf0d677478280207ffebeef9526",
+      "kind": "result",
+      "title": "Result",
+      "x": 440,
+      "y": -30,
+      "config": {
+        "template": "{{work}}",
+        "save_path": "",
+        "true_limit": 1,
+        "false_limit": 3
+      }
+    },
+    {
+      "id": "6e22d7f0f447448bb8bee74f18be4464",
+      "kind": "work_reviewer",
+      "title": "Work Reviewer",
+      "x": -100,
+      "y": 190,
+      "config": {
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "medium",
+        "instructions": "Ти аналізуєш протокол роботи Flow. Для кожного блоку оціни, наскільки оптимально він працював: зайві кроки, повтори, недостатній чи надмірний контекст, причини переробок.",
+        "instruction_files": [],
+        "prompt": "# Протокол роботи Flow\nПротокол додано файлом: {{protocol_path}}\n\nПроаналізуй роботу кожного блоку і дай конкретні рекомендації.",
+        "prompt_source": "template",
+        "sandbox": "read-only",
+        "workspace": "",
+        "additional_folders": [],
+        "output_format": "text",
+        "output_schema": {},
+        "attachments": [],
+        "timeout_seconds": 1800,
+        "retries": 0,
+        "memory": "thread",
+        "monitor_all": true,
+        "monitored_nodes": [],
+        "report_path": ""
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "be698a5b6070405b9fa9d2070cd68c72",
+      "source": "af6de005f8634218a4c273eb2e640302",
+      "target": "da806461a6484af1946608daf6373d56",
+      "source_port": "out",
+      "source_path": "text",
+      "target_variable": "entry_prompt",
+      "condition": "",
+      "transform": "",
+      "label": "промпт"
+    },
+    {
+      "id": "ac5f3264bfc744a18380689c4b7fb6d1",
+      "source": "af6de005f8634218a4c273eb2e640302",
+      "target": "aee5897199834abcbf589cd238e9a536",
+      "source_port": "out",
+      "source_path": "data.attachments",
+      "target_variable": "attachments",
+      "condition": "",
+      "transform": "",
+      "label": "файли"
+    },
+    {
+      "id": "35e3845dae4946cd9ecc7f0d58ae3070",
+      "source": "da806461a6484af1946608daf6373d56",
+      "target": "aee5897199834abcbf589cd238e9a536",
+      "source_port": "out",
+      "source_path": "text",
+      "target_variable": "prompt",
+      "condition": "",
+      "transform": "",
+      "label": "уточнений промпт"
+    },
+    {
+      "id": "667725c06acb41adb0c03141b4aca741",
+      "source": "aee5897199834abcbf589cd238e9a536",
+      "target": "53dfd7097447473697423a2e89194898",
+      "source_port": "out",
+      "source_path": "text",
+      "target_variable": "work",
+      "condition": "",
+      "transform": "",
+      "label": "робота"
+    },
+    {
+      "id": "9bfb3e42b43a422b9aa695f7899318dd",
+      "source": "aee5897199834abcbf589cd238e9a536",
+      "target": "62a75cf0d677478280207ffebeef9526",
+      "source_port": "out",
+      "source_path": "text",
+      "target_variable": "work",
+      "condition": "",
+      "transform": "",
+      "label": "робота"
+    },
+    {
+      "id": "7f1b35d35ac5497d83af1c538d7601a1",
+      "source": "53dfd7097447473697423a2e89194898",
+      "target": "62a75cf0d677478280207ffebeef9526",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "review",
+      "condition": "",
+      "transform": "",
+      "label": "вердикт"
+    },
+    {
+      "id": "85e54cbcc2a7473485c08b57bc908226",
+      "source": "62a75cf0d677478280207ffebeef9526",
+      "target": "aee5897199834abcbf589cd238e9a536",
+      "source_port": "false",
+      "source_path": "data.reason",
+      "target_variable": "prompt",
+      "condition": "",
+      "transform": "Рев'ювер повернув роботу на переробку.\nПричина: {{value}}\nВиправ саме це і поверни оновлений результат.",
+      "label": "переробити"
+    }
+  ]
+}
