@@ -30,6 +30,33 @@ QToolButton#expandTextButton:hover {
     background: #4C3AC7;
     border-color: #A78BFA;
 }
+QFrame#managedTaskEditor {
+    background: #101827;
+    border: 1px solid #344259;
+    border-radius: 7px;
+}
+QLabel#managedTaskHeading {
+    color: #BFDBFE;
+    font-weight: 700;
+}
+QToolButton#removeManagedTaskButton {
+    background: #7F1D1D;
+    border-color: #B91C1C;
+    color: #FFFFFF;
+    padding: 1px;
+    font-size: 16px;
+}
+QToolButton#removeManagedTaskButton:disabled {
+    background: #374151;
+    border-color: #4B5563;
+    color: #9CA3AF;
+}
+QPushButton#addManagedTaskButton {
+    background: #1E3A5F;
+    border-color: #3B82F6;
+    color: #DBEAFE;
+    font-weight: 600;
+}
 QToolButton#runButton {
     background: #15803D;
     border-color: #22C55E;

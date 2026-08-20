@@ -124,6 +124,80 @@ def test_cycle_without_result_is_rejected() -> None:
     assert any("цикл" in error for error in workflow.validate())
 
 
+def test_tasks_manager_processes_each_task_and_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_file = tmp_path / "first.md"
+    second_file = tmp_path / "second.png"
+    first_file.write_text("first", encoding="utf-8")
+    second_file.write_bytes(b"second")
+
+    manager = FlowNode.create("tasks_manager")
+    manager.config["tasks"] = [
+        {
+            "id": "task-one",
+            "prompt": "Проаналізуй перше завдання",
+            "attachments": [str(first_file)],
+        },
+        {
+            "id": "task-two",
+            "prompt": "Виконай друге завдання",
+            "attachments": [str(second_file)],
+        },
+    ]
+    reviewer = FlowNode.create("task_reviewer")
+    reviewer.config["model"] = "reviewer-model"
+    result = FlowNode.create("result")
+    result.config["true_limit"] = 1
+
+    to_reviewer = FlowEdge.create(manager.id, reviewer.id, "next")
+    to_reviewer.source_path = "data"
+    to_reviewer.target_variable = "input"
+    to_result = FlowEdge.create(reviewer.id, result.id)
+    to_result.source_path = "data"
+    to_result.target_variable = "review"
+    next_task = FlowEdge.create(result.id, manager.id, "true")
+    next_task.source_path = "data"
+    next_task.target_variable = "input"
+    workflow = Workflow(
+        name="Tasks",
+        workspace=str(tmp_path),
+        nodes=[manager, reviewer, result],
+        edges=[to_reviewer, to_result, next_task],
+    )
+    assert workflow.validate() == []
+    assert workflow.ports_of(manager.id) == ("next", "done")
+    assert workflow.result_port_limit(result, "true") == 2
+
+    monkeypatch.setattr(codex_adapter, "FAKE_RESPONDER", verdict_script(True, True))
+    events: list[dict[str, Any]] = []
+    runner = WorkflowRunner(
+        workflow,
+        run_directory=tmp_path / "runs",
+        on_event=events.append,
+    )
+    checkpoint = runner.run()
+
+    assert checkpoint.iterations[manager.id] == 3
+    assert checkpoint.iterations[reviewer.id] == 2
+    assert checkpoint.port_counts[f"{result.id}:true"] == 2
+    assert checkpoint.task_progress[manager.id] == {
+        "active_task_id": "",
+        "completed_task_ids": ["task-one", "task-two"],
+    }
+    assert runner.outputs[manager.id].data["branch"] == "done"
+    progress = [event for event in events if event["type"] == "tasks_progress"]
+    assert [event["completed_count"] for event in progress] == [0, 1, 2]
+    reviewer_calls = [
+        call for call in codex_adapter.FAKE_CALLS if call["model"] == "reviewer-model"
+    ]
+    assert len(reviewer_calls) == 2
+    assert "Проаналізуй перше завдання" in reviewer_calls[0]["prompt"]
+    assert reviewer_calls[0]["attachments"] == [str(first_file)]
+    assert "Виконай друге завдання" in reviewer_calls[1]["prompt"]
+    assert reviewer_calls[1]["attachments"] == [str(second_file)]
+
+
 def test_result_without_task_reviewer_is_rejected() -> None:
     workflow = Workflow()
     entry = FlowNode.create("entry")

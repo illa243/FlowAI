@@ -198,7 +198,8 @@ def test_dock_layers_are_compact_and_keep_only_controls() -> None:
     assert "Додати ноду" not in visible_texts
     assert "Властивості" not in visible_texts
     assert "З'єднання" not in visible_texts
-    assert len(window.node_buttons) == 6
+    assert len(window.node_buttons) == 7
+    assert any("Tasks Manager" in button.text() for button in window.node_buttons)
     window.close()
 
 
@@ -1124,6 +1125,71 @@ def test_inspector_shows_only_the_fields_of_the_selected_kind() -> None:
     inspector.close()
 
 
+def test_tasks_manager_parameters_add_edit_files_and_remove(tmp_path: Path) -> None:
+    application()
+    attachment = tmp_path / "brief.md"
+    attachment.write_text("brief", encoding="utf-8")
+    node = FlowNode.create("tasks_manager")
+    node.config["tasks"][0]["prompt"] = "Перше завдання"
+    inspector = Inspector()
+    inspector.set_workflow(Workflow(nodes=[node]))
+    inspector.set_object(node)
+
+    assert inspector.node_rows["tasks"][1].isVisibleTo(inspector.node_page)
+    assert len(inspector.tasks_editor.sections) == 1
+    assert inspector.tasks_editor.sections[0].heading.text().endswith("Перше завдання")
+
+    inspector.tasks_editor.add_button.click()
+    assert len(node.config["tasks"]) == 2
+    second = inspector.tasks_editor.sections[1]
+    second.prompt.setPlainText("Друге завдання")
+    second.attachments.add_paths([str(attachment)])
+    assert node.config["tasks"][1]["prompt"] == "Друге завдання"
+    assert node.config["tasks"][1]["attachments"] == [str(attachment)]
+
+    second.remove_button.click()
+    assert len(inspector.tasks_editor.sections) == 1
+    assert len(node.config["tasks"]) == 1
+    assert inspector.tasks_editor.sections[0].remove_button.isEnabled() is False
+    inspector.close()
+
+
+def test_tasks_manager_canvas_has_next_done_ports_and_task_states() -> None:
+    application()
+    manager = FlowNode.create("tasks_manager")
+    manager.config["tasks"] = [
+        {"id": "one", "prompt": "Перше", "attachments": []},
+        {"id": "two", "prompt": "Друге", "attachments": []},
+        {"id": "three", "prompt": "Третє", "attachments": []},
+    ]
+    result = FlowNode.create("result")
+    back = FlowEdge.create(result.id, manager.id, "true")
+    workflow = Workflow(nodes=[manager, result], edges=[back])
+    scene = FlowScene()
+    scene.set_workflow(workflow)
+
+    item = scene.node_items[manager.id]
+    assert set(item.output_ports) == {"next", "done"}
+    assert item.output_ports["next"].label == "NEXT"
+    assert item.output_ports["done"].label == "DONE"
+    assert item.boundingRect().height() > 130
+
+    scene.set_task_states(
+        manager.id,
+        [
+            {"id": "one", "title": "Перше", "status": "completed"},
+            {"id": "two", "title": "Друге", "status": "running"},
+            {"id": "three", "title": "Третє", "status": "pending"},
+        ],
+    )
+    assert item.has_active_task() is True
+    assert item.task_states[0]["status"] == "completed"
+    assert scene._running_timer.isActive() is True
+
+    scene.apply_port_counts({f"{result.id}:true": 1})
+    assert scene.node_items[result.id].output_ports["true"].label == "TRUE 1/3"
+
+
 def test_parameters_title_and_model_field_open_the_model_list() -> None:
     app = application()
     window = MainWindow(
@@ -1256,6 +1322,7 @@ def test_large_parameter_fields_have_top_right_expand_button() -> None:
         "Схема JSON",
         "Шаблон результату",
         "Перетворення",
+        "Промпт завдання 1",
     }
     button = inspector.instructions_edit.expand_button
     assert button.objectName() == "expandTextButton"

@@ -14,6 +14,7 @@ class UnsupportedFlowFormat(ValueError):
 
 NODE_LABELS = {
     "entry": "Entry prompt",
+    "tasks_manager": "Tasks Manager",
     "prompt_reviewer": "Prompt Reviewer",
     "executor": "Task Executor",
     "task_reviewer": "Task Reviewer",
@@ -24,6 +25,7 @@ NODE_LABELS = {
 
 NODE_COLORS = {
     "entry": "#3B82F6",
+    "tasks_manager": "#2563EB",
     "prompt_reviewer": "#0891B2",
     "executor": "#7C3AED",
     "task_reviewer": "#D97706",
@@ -41,6 +43,7 @@ AGENT_KINDS = frozenset(
 SIDECAR_KINDS = frozenset({"work_reviewer"})
 
 RESULT_PORTS = ("true", "false")
+TASK_MANAGER_PORTS = ("next", "done")
 DEFAULT_PORT = "out"
 
 
@@ -79,6 +82,47 @@ def _agent_defaults(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+def new_managed_task(prompt: str = "") -> dict[str, Any]:
+    return {
+        "id": uuid4().hex,
+        "prompt": str(prompt),
+        "attachments": [],
+    }
+
+
+def normalize_managed_tasks(raw: Any) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    source = raw if isinstance(raw, list) else []
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        task_id = str(item.get("id") or uuid4().hex)
+        if any(existing["id"] == task_id for existing in tasks):
+            task_id = uuid4().hex
+        tasks.append(
+            {
+                "id": task_id,
+                "prompt": str(item.get("prompt", "")),
+                "attachments": [
+                    str(path) for path in item.get("attachments", []) if str(path)
+                ],
+            }
+        )
+    return tasks or [new_managed_task()]
+
+
+def managed_task_title(task: dict[str, Any], index: int) -> str:
+    first_line = next(
+        (
+            line.strip()
+            for line in str(task.get("prompt", "")).splitlines()
+            if line.strip()
+        ),
+        "",
+    )
+    return first_line[:54] or f"Завдання {index + 1}"
+
+
 def _default_config(kind: str) -> dict[str, Any]:
     defaults: dict[str, dict[str, Any]] = {
         "entry": {
@@ -86,6 +130,7 @@ def _default_config(kind: str) -> dict[str, Any]:
             "json": {},
             "attachments": [],
         },
+        "tasks_manager": {"tasks": [new_managed_task()]},
         "prompt_reviewer": _agent_defaults(
             instructions=(
                 "Ти покращуєш вхідний промпт перед тим, як його виконає інший агент. "
@@ -194,6 +239,8 @@ class FlowNode:
             )
         config = _default_config(kind)
         config.update(raw.get("config") or {})
+        if kind == "tasks_manager":
+            config["tasks"] = normalize_managed_tasks(config.get("tasks"))
         return cls(
             id=str(raw["id"]),
             kind=kind,
@@ -304,7 +351,24 @@ class Workflow:
             return ()
         if node.kind == "result":
             return RESULT_PORTS
+        if node.kind == "tasks_manager":
+            return TASK_MANAGER_PORTS
         return (DEFAULT_PORT,)
+
+    def result_port_limit(self, node: FlowNode, port: str) -> int:
+        configured = max(1, int(node.config.get(f"{port}_limit", 1)))
+        if node.kind != "result" or port != "true":
+            return configured
+        managed_count = 0
+        for edge in self.outgoing(node.id, "true"):
+            target = self.find(edge.target)
+            if target is None or target.kind != "tasks_manager":
+                continue
+            managed_count = max(
+                managed_count,
+                len(normalize_managed_tasks(target.config.get("tasks"))),
+            )
+        return max(configured, managed_count)
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -340,6 +404,28 @@ class Workflow:
 
         if len(self.nodes_of_kind("work_reviewer")) > 1:
             errors.append("У Flow може бути лише один блок Work Reviewer")
+
+        for node in self.nodes_of_kind("tasks_manager"):
+            tasks = normalize_managed_tasks(node.config.get("tasks"))
+            for index, task in enumerate(tasks):
+                if not str(task.get("prompt", "")).strip():
+                    errors.append(
+                        f"У блоці «{node.title}» завдання {index + 1} не має промпту"
+                    )
+            if not self.outgoing(node.id, "next"):
+                errors.append(
+                    f"Блок «{node.title}» потребує з'єднання з виходу NEXT"
+                )
+            has_result_return = any(
+                edge.source_port == "true"
+                and (source := self.find(edge.source)) is not None
+                and source.kind == "result"
+                for edge in self.incoming(node.id)
+            )
+            if not has_result_return:
+                errors.append(
+                    f"До блока «{node.title}» потрібно повернути вихід TRUE блока Result"
+                )
 
         for node in self.nodes_of_kind("task_reviewer"):
             reference = str(node.config.get("criteria_node", "")).strip()

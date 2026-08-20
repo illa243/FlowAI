@@ -1022,6 +1022,7 @@ class MainWindow(QMainWindow):
         self.node_buttons: list[QPushButton] = []
         for kind in [
             "entry",
+            "tasks_manager",
             "prompt_reviewer",
             "executor",
             "task_reviewer",
@@ -1341,6 +1342,7 @@ class MainWindow(QMainWindow):
             session.node_duration_history.clear()
             session.node_started_at.clear()
             session.node_stages.clear()
+            session.task_states.clear()
             session.port_counts.clear()
             self.log_view.clear()
             session.log_text = ""
@@ -1498,6 +1500,20 @@ class MainWindow(QMainWindow):
             }
             if session.id == self.current_workspace_id:
                 self.scene.apply_port_counts(session.port_counts)
+        task_states = event.get("task_states")
+        if node_id and isinstance(task_states, list):
+            clean_states = [
+                {
+                    "id": str(item.get("id", "")),
+                    "title": str(item.get("title", "")),
+                    "status": str(item.get("status", "pending")),
+                }
+                for item in task_states
+                if isinstance(item, dict)
+            ]
+            session.task_states[str(node_id)] = clean_states
+            if session.id == self.current_workspace_id:
+                self.scene.set_task_states(str(node_id), clean_states)
 
         title = event.get("node_title")
         message = event.get("message", "")
@@ -1587,6 +1603,13 @@ class MainWindow(QMainWindow):
             self._append_session_log(session, f"▶ {message}")
         elif event_type == "node_config_updated":
             self._append_session_log(session, f"{prefix}: {message}", color=color)
+        elif event_type == "tasks_progress":
+            self._append_session_log(
+                session,
+                f"{prefix}: {message} "
+                f"({event.get('completed_count', 0)}/{event.get('task_count', 0)})",
+                color=color,
+            )
         elif event_type in {
             "work_review_started",
             "work_review_finished",
@@ -1922,6 +1945,7 @@ class MainWindow(QMainWindow):
         )
         self.scene.apply_node_statuses(session.node_statuses)
         self.scene.apply_node_stages(session.node_stages)
+        self.scene.apply_task_states(session.task_states)
         if session.checkpoint is not None:
             session.port_counts = dict(session.checkpoint.port_counts)
         if session.port_counts:
@@ -2212,6 +2236,7 @@ class MainWindow(QMainWindow):
             session.node_duration_history.clear()
             session.node_started_at.clear()
             session.node_stages.clear()
+            session.task_states.clear()
             session.port_counts.clear()
             session.checkpoint = None
             if session.id == self.current_workspace_id:
@@ -2385,6 +2410,7 @@ class MainWindow(QMainWindow):
             )
             self.scene.apply_node_statuses(session.node_statuses)
             self.scene.apply_node_stages(session.node_stages)
+            self.scene.apply_task_states(session.task_states)
             self.dirty = session.dirty
             self._update_title()
         self._persist_workspace_registry()

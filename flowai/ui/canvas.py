@@ -32,6 +32,8 @@ from ..models import (
     FlowEdge,
     FlowNode,
     Workflow,
+    managed_task_title,
+    normalize_managed_tasks,
 )
 
 NODE_WIDTH = 220.0
@@ -41,6 +43,8 @@ PORT_COLORS = {
     DEFAULT_PORT: "#A78BFA",
     "true": "#22C55E",
     "false": "#EF4444",
+    "next": "#3B82F6",
+    "done": "#22C55E",
 }
 
 
@@ -253,6 +257,8 @@ class NodeItem(QGraphicsObject):
         self.stage_name = ""
         self.attention = False
         self.blink_on = False
+        self.task_states = self._configured_task_states()
+        self.node_height = self._desired_height()
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsMovable
             | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
@@ -267,7 +273,7 @@ class NodeItem(QGraphicsObject):
             return
 
         self.input_port = PortItem(self, "input")
-        self.input_port.setPos(0, NODE_HEIGHT / 2)
+        self.input_port.setPos(0, self.node_height / 2)
         if model.kind == "result":
             true_port = PortItem(self, "output", "true", "TRUE 0/1")
             true_port.setPos(NODE_WIDTH, NODE_HEIGHT / 3)
@@ -275,10 +281,71 @@ class NodeItem(QGraphicsObject):
             false_port.setPos(NODE_WIDTH, NODE_HEIGHT * 2 / 3)
             self.output_ports = {"true": true_port, "false": false_port}
             self.refresh_port_labels()
+        elif model.kind == "tasks_manager":
+            next_port = PortItem(self, "output", "next", "NEXT")
+            next_port.setPos(NODE_WIDTH, self.node_height / 3)
+            done_port = PortItem(self, "output", "done", "DONE")
+            done_port.setPos(NODE_WIDTH, self.node_height * 2 / 3)
+            self.output_ports = {"next": next_port, "done": done_port}
         else:
             port = PortItem(self, "output", DEFAULT_PORT)
-            port.setPos(NODE_WIDTH, NODE_HEIGHT / 2)
+            port.setPos(NODE_WIDTH, self.node_height / 2)
             self.output_ports = {DEFAULT_PORT: port}
+
+    def _configured_task_states(self) -> list[dict[str, str]]:
+        if self.model.kind != "tasks_manager":
+            return []
+        return [
+            {
+                "id": str(task["id"]),
+                "title": managed_task_title(task, index),
+                "status": "pending",
+            }
+            for index, task in enumerate(
+                normalize_managed_tasks(self.model.config.get("tasks"))
+            )
+        ]
+
+    def _desired_height(self) -> float:
+        if self.model.kind != "tasks_manager":
+            return NODE_HEIGHT
+        return max(150.0, 86.0 + len(self.task_states) * 22.0)
+
+    def refresh_task_config(self) -> None:
+        if self.model.kind != "tasks_manager":
+            return
+        states_by_id = {str(item.get("id")): item for item in self.task_states}
+        configured = self._configured_task_states()
+        for item in configured:
+            previous = states_by_id.get(item["id"])
+            if previous is not None:
+                item["status"] = str(previous.get("status", "pending"))
+        height = max(150.0, 86.0 + len(configured) * 22.0)
+        if height != self.node_height:
+            self.prepareGeometryChange()
+            self.node_height = height
+        self.task_states = configured
+        self._layout_ports()
+        for edge in self.edges:
+            edge.update_path()
+        self.update()
+
+    def _layout_ports(self) -> None:
+        if self.input_port is not None:
+            self.input_port.setPos(0, self.node_height / 2)
+        if self.model.kind == "tasks_manager":
+            if next_port := self.output_ports.get("next"):
+                next_port.setPos(NODE_WIDTH, self.node_height / 3)
+            if done_port := self.output_ports.get("done"):
+                done_port.setPos(NODE_WIDTH, self.node_height * 2 / 3)
+        elif self.model.kind == "result":
+            if true_port := self.output_ports.get("true"):
+                true_port.setPos(NODE_WIDTH, self.node_height / 3)
+            if false_port := self.output_ports.get("false"):
+                false_port.setPos(NODE_WIDTH, self.node_height * 2 / 3)
+        else:
+            for port in self.output_ports.values():
+                port.setPos(NODE_WIDTH, self.node_height / 2)
 
     def output_port_item(self, name: str) -> PortItem | None:
         if name in self.output_ports:
@@ -294,10 +361,13 @@ class NodeItem(QGraphicsObject):
             if port is None:
                 continue
             limit = int(self.model.config.get(f"{name}_limit", 1))
+            scene = self.scene()
+            if isinstance(scene, FlowScene):
+                limit = scene.workflow.result_port_limit(self.model, name)
             port.set_label(f"{name.upper()} {counts.get(name, 0)}/{limit}")
 
     def boundingRect(self) -> QRectF:
-        return QRectF(0, 0, NODE_WIDTH, NODE_HEIGHT)
+        return QRectF(0, 0, NODE_WIDTH, self.node_height)
 
     def paint(self, painter: QPainter, option: Any, widget: Any = None) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -352,6 +422,10 @@ class NodeItem(QGraphicsObject):
             self.model.title,
         )
 
+        if self.model.kind == "tasks_manager":
+            self._paint_tasks(painter)
+            return
+
         painter.setPen(QColor("#94A3B8"))
         font.setBold(False)
         font.setPointSize(8)
@@ -391,6 +465,59 @@ class NodeItem(QGraphicsObject):
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                 line,
             )
+
+    def _paint_tasks(self, painter: QPainter) -> None:
+        font = painter.font()
+        font.setBold(False)
+        font.setPointSize(8)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        for index, task in enumerate(self.task_states):
+            y = 44.0 + index * 22.0
+            status = str(task.get("status", "pending"))
+            if status == "completed":
+                painter.setPen(QPen(QColor("#4ADE80"), 2.2))
+                painter.drawLine(QPointF(14, y + 8), QPointF(18, y + 12))
+                painter.drawLine(QPointF(18, y + 12), QPointF(25, y + 4))
+            elif status == "running":
+                painter.setPen(QPen(QColor("#60A5FA"), 2.2))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                angle = -round(time.monotonic() * 300 * 16)
+                painter.drawArc(QRectF(13, y + 2, 13, 13), angle, 250 * 16)
+            else:
+                painter.setPen(QPen(QColor("#64748B"), 1.5))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(QRectF(16, y + 5, 7, 7))
+            painter.setPen(
+                QColor("#E5E7EB") if status == "running" else QColor("#CBD5E1")
+            )
+            title = metrics.elidedText(
+                str(task.get("title", f"Завдання {index + 1}")),
+                Qt.TextElideMode.ElideRight,
+                round(NODE_WIDTH - 48),
+            )
+            painter.drawText(
+                QRectF(32, y, NODE_WIDTH - 44, 18),
+                Qt.AlignmentFlag.AlignVCenter,
+                title,
+            )
+
+        completed = sum(
+            1 for task in self.task_states if task.get("status") == "completed"
+        )
+        footer_y = self.node_height - 28
+        painter.setPen(QColor("#94A3B8"))
+        painter.drawText(
+            QRectF(14, footer_y, NODE_WIDTH - 90, 18),
+            Qt.AlignmentFlag.AlignVCenter,
+            f"Виконано {completed}/{len(self.task_states)}",
+        )
+        painter.setPen(QColor("#CBD5E1"))
+        painter.drawText(
+            QRectF(NODE_WIDTH - 92, footer_y, 78, 18),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+            self._time_lines()[-1],
+        )
 
     @staticmethod
     def _blend_color(start: QColor, end: QColor, amount: float) -> QColor:
@@ -461,6 +588,7 @@ class NodeItem(QGraphicsObject):
             return f"{model} · Міркування: {reasoning}\n{sandbox}"
         descriptions = {
             "entry": "Вхідний промпт і вкладення",
+            "tasks_manager": "Черга послідовних завдань",
             "result": "Розгалуження True/False",
         }
         return descriptions.get(self.model.kind, self.model.kind)
@@ -510,6 +638,32 @@ class NodeItem(QGraphicsObject):
         self.attention = attention
         self.blink_on = attention
         self.update()
+
+    def set_task_states(self, states: list[dict[str, Any]]) -> None:
+        if self.model.kind != "tasks_manager":
+            return
+        known = {str(item.get("id")): item for item in self.task_states}
+        merged: list[dict[str, str]] = []
+        for index, raw in enumerate(states):
+            task_id = str(raw.get("id", ""))
+            previous = known.get(task_id, {})
+            merged.append(
+                {
+                    "id": task_id,
+                    "title": str(
+                        raw.get("title")
+                        or previous.get("title")
+                        or f"Завдання {index + 1}"
+                    ),
+                    "status": str(raw.get("status", "pending")),
+                }
+            )
+        if merged:
+            self.task_states = merged
+        self.update()
+
+    def has_active_task(self) -> bool:
+        return any(task.get("status") == "running" for task in self.task_states)
 
 
 class EdgeControlPointItem(QGraphicsObject):
@@ -978,8 +1132,14 @@ class FlowScene(QGraphicsScene):
         if isinstance(model, FlowNode):
             item = self.node_items.get(model.id)
             if item:
+                item.refresh_task_config()
                 item.refresh_port_labels()
                 item.update()
+            if model.kind == "tasks_manager":
+                for result in self.workflow.nodes_of_kind("result"):
+                    result_item = self.node_items.get(result.id)
+                    if result_item is not None:
+                        result_item.refresh_port_labels()
         else:
             item = self.edge_items.get(model.id)
             if item:
@@ -992,6 +1152,9 @@ class FlowScene(QGraphicsScene):
             item.set_runtime(0.0, history=[])
             item.set_stage(0, 0, "")
             item.set_attention(False)
+            item.refresh_task_config()
+            if item.model.kind == "tasks_manager":
+                item.set_task_states(item._configured_task_states())
             item.refresh_port_labels()
         self._blink_timer.stop()
         self._running_timer.stop()
@@ -1065,6 +1228,16 @@ class FlowScene(QGraphicsScene):
         for node_id, item in self.node_items.items():
             item.refresh_port_labels(grouped.get(node_id, {}))
 
+    def set_task_states(self, node_id: str, states: list[dict[str, Any]]) -> None:
+        item = self.node_items.get(node_id)
+        if item is not None:
+            item.set_task_states(states)
+        self._sync_running_timer()
+
+    def apply_task_states(self, task_states: dict[str, list[dict[str, Any]]]) -> None:
+        for node_id, states in task_states.items():
+            self.set_task_states(node_id, states)
+
     def _toggle_blink(self) -> None:
         for item in self.node_items.values():
             if item.attention:
@@ -1072,7 +1245,10 @@ class FlowScene(QGraphicsScene):
                 item.update()
 
     def _sync_running_timer(self) -> None:
-        running = any(item.status == "running" for item in self.node_items.values())
+        running = any(
+            item.status == "running" or item.has_active_task()
+            for item in self.node_items.values()
+        )
         if running and not self._running_timer.isActive():
             self._running_timer.start()
         elif not running:
@@ -1080,7 +1256,7 @@ class FlowScene(QGraphicsScene):
 
     def _update_running_nodes(self) -> None:
         for item in self.node_items.values():
-            if item.status == "running":
+            if item.status == "running" or item.has_active_task():
                 item.update()
 
 

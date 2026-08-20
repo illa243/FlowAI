@@ -19,6 +19,8 @@ from .models import (
     RESULT_PORTS,
     FlowNode,
     Workflow,
+    managed_task_title,
+    normalize_managed_tasks,
 )
 from .templating import (
     extract_json,
@@ -109,6 +111,7 @@ class RunCheckpoint:
     history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     protocol_records: dict[str, list[str]] = field(default_factory=dict)
     protocol_path: str = ""
+    task_progress: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -124,6 +127,7 @@ class RunCheckpoint:
             "history": self.history,
             "protocol_records": self.protocol_records,
             "protocol_path": self.protocol_path,
+            "task_progress": self.task_progress,
         }
 
     @classmethod
@@ -141,6 +145,7 @@ class RunCheckpoint:
             history=dict(raw.get("history") or {}),
             protocol_records=dict(raw.get("protocol_records") or {}),
             protocol_path=str(raw.get("protocol_path", "")),
+            task_progress=dict(raw.get("task_progress") or {}),
         )
 
     def node_results(self) -> dict[str, NodeResult]:
@@ -276,7 +281,11 @@ class WorkflowRunner:
             self.checkpoint.queue = [
                 node.id
                 for node in self.workflow.routed_nodes()
-                if not self.workflow.incoming(node.id)
+                if not any(
+                    (source := self.workflow.find(edge.source)) is not None
+                    and source.kind != "result"
+                    for edge in self.workflow.incoming(node.id)
+                )
             ]
             self.checkpoint.started = True
         if reviewer is not None:
@@ -468,7 +477,7 @@ class WorkflowRunner:
     def _dispatch(self, node: FlowNode, result: NodeResult) -> None:
         port = DEFAULT_PORT
         note = ""
-        if node.kind == "result" and isinstance(result.data, dict):
+        if node.kind in {"result", "tasks_manager"} and isinstance(result.data, dict):
             port = str(result.data.get("branch") or DEFAULT_PORT)
             note = str(result.data.get("user_note") or "")
 
@@ -601,6 +610,10 @@ class WorkflowRunner:
             ]
             return NodeResult(node.id, "success", text=text, data=data)
 
+        if node.kind == "tasks_manager":
+            self._stage(node, 4, "Вибір наступного завдання")
+            return self._execute_tasks_manager(node)
+
         if node.kind == "result":
             self._stage(node, 4, "Перевірка умови розгалуження")
             return self._execute_result(node, inputs, context, workspace)
@@ -609,6 +622,97 @@ class WorkflowRunner:
             return self._execute_agent(node, inputs, context, workspace, codex)
 
         raise WorkflowError(f"Тип ноди ще не підтримується: {node.kind}")
+
+    def _execute_tasks_manager(self, node: FlowNode) -> NodeResult:
+        tasks = normalize_managed_tasks(node.config.get("tasks"))
+        valid_ids = {str(task["id"]) for task in tasks}
+        progress = self.checkpoint.task_progress.setdefault(
+            node.id,
+            {"active_task_id": "", "completed_task_ids": []},
+        )
+        completed = [
+            str(task_id)
+            for task_id in progress.get("completed_task_ids", [])
+            if str(task_id) in valid_ids
+        ]
+        active_id = str(progress.get("active_task_id", ""))
+        if active_id in valid_ids and active_id not in completed:
+            completed.append(active_id)
+
+        active_task: dict[str, Any] | None = next(
+            (task for task in tasks if str(task["id"]) not in completed),
+            None,
+        )
+        active_id = str(active_task["id"]) if active_task is not None else ""
+        progress["active_task_id"] = active_id
+        progress["completed_task_ids"] = completed
+
+        states = []
+        for index, task in enumerate(tasks):
+            task_id = str(task["id"])
+            status = (
+                "completed"
+                if task_id in completed
+                else "running"
+                if task_id == active_id
+                else "pending"
+            )
+            states.append(
+                {
+                    "id": task_id,
+                    "title": managed_task_title(task, index),
+                    "status": status,
+                }
+            )
+
+        branch = "next" if active_task is not None else "done"
+        message = (
+            f"Активовано: {managed_task_title(active_task, tasks.index(active_task))}"
+            if active_task is not None
+            else "Усі завдання виконано"
+        )
+        self._emit(
+            "tasks_progress",
+            node=node,
+            message=message,
+            task_states=states,
+            active_task_id=active_id,
+            completed_count=len(completed),
+            task_count=len(tasks),
+        )
+
+        if active_task is None:
+            data = {
+                "branch": branch,
+                "tasks": states,
+                "completed_count": len(completed),
+                "task_count": len(tasks),
+            }
+            return NodeResult(node.id, "success", text=message, data=data)
+
+        task_index = tasks.index(active_task)
+        prompt = str(active_task.get("prompt", ""))
+        attachments = [
+            str(path) for path in active_task.get("attachments", []) if str(path)
+        ]
+        task_payload = {
+            "id": active_id,
+            "index": task_index,
+            "number": task_index + 1,
+            "title": managed_task_title(active_task, task_index),
+            "prompt": prompt,
+            "attachments": attachments,
+        }
+        data = {
+            "branch": branch,
+            "prompt": prompt,
+            "task": task_payload,
+            "attachments": attachments,
+            "tasks": states,
+            "completed_count": len(completed),
+            "task_count": len(tasks),
+        }
+        return NodeResult(node.id, "success", text=prompt, data=data)
 
     def _execute_result(
         self,
@@ -683,7 +787,7 @@ class WorkflowRunner:
         key = f"{node.id}:{port}"
         used = self.checkpoint.port_counts.get(key, 0)
         with self._control_lock:
-            configured_limit = int(node.config.get(f"{port}_limit", 1))
+            configured_limit = self.workflow.result_port_limit(node, port)
         limit = configured_limit + self.checkpoint.limit_grants.get(key, 0)
         if not forced and used + 1 > limit:
             raise InterventionRequired(
@@ -768,7 +872,22 @@ class WorkflowRunner:
         if node.kind == "prompt_reviewer":
             context["flow_chain"] = self.workflow.describe_chain(node.id)
             if not str(context.get("entry_prompt", "")).strip():
-                context["entry_prompt"] = stringify(inputs) if inputs else ""
+                managed_input = next(
+                    (
+                        value
+                        for key in ("task", "input", "data")
+                        if isinstance((value := inputs.get(key)), dict)
+                        and str(value.get("prompt", "")).strip()
+                    ),
+                    None,
+                )
+                context["entry_prompt"] = (
+                    str(managed_input["prompt"])
+                    if managed_input is not None
+                    else stringify(inputs)
+                    if inputs
+                    else ""
+                )
         elif (
             node.kind == "task_reviewer"
             and not str(context.get("criteria", "")).strip()
@@ -1098,6 +1217,7 @@ class WorkflowRunner:
             raw.append(incoming)
         elif isinstance(incoming, list):
             raw.extend(str(item) for item in incoming if str(item))
+        raw.extend(self._active_managed_task_attachments(node))
 
         resolved: list[Path] = []
         for item in raw:
@@ -1107,6 +1227,45 @@ class WorkflowRunner:
             if path not in resolved:
                 resolved.append(path)
         return resolved
+
+    def _active_managed_task_attachments(self, target: FlowNode) -> list[str]:
+        attachments: list[str] = []
+        for manager in self.workflow.nodes_of_kind("tasks_manager"):
+            if not self._is_forward_upstream(manager.id, target.id):
+                continue
+            progress = self.checkpoint.task_progress.get(manager.id, {})
+            active_id = str(progress.get("active_task_id", ""))
+            task = next(
+                (
+                    item
+                    for item in normalize_managed_tasks(manager.config.get("tasks"))
+                    if str(item["id"]) == active_id
+                ),
+                None,
+            )
+            if task is None:
+                continue
+            for path in task.get("attachments", []):
+                value = str(path)
+                if value and value not in attachments:
+                    attachments.append(value)
+        return attachments
+
+    def _is_forward_upstream(self, source_id: str, target_id: str) -> bool:
+        seen: set[str] = set()
+        stack = [edge.target for edge in self.workflow.outgoing(source_id)]
+        while stack:
+            current = stack.pop()
+            if current == target_id:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            current_node = self.workflow.find(current)
+            if current_node is not None and current_node.kind == "result":
+                continue
+            stack.extend(edge.target for edge in self.workflow.outgoing(current))
+        return False
 
     def _compose_agent_prompt(
         self,

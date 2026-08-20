@@ -26,6 +26,7 @@ class WorkspaceSession:
     node_duration_history: dict[str, list[float]] = field(default_factory=dict)
     node_started_at: dict[str, float] = field(default_factory=dict)
     node_stages: dict[str, tuple[int, int, str]] = field(default_factory=dict)
+    task_states: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     port_counts: dict[str, int] = field(default_factory=dict)
     checkpoint: Any = None
     run_directory: Any = None

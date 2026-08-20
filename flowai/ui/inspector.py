@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -28,7 +30,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..models import NODE_LABELS, FlowEdge, FlowNode, Workflow
+from ..models import (
+    NODE_LABELS,
+    FlowEdge,
+    FlowNode,
+    Workflow,
+    managed_task_title,
+    normalize_managed_tasks,
+)
 from .attachments import AttachmentListWidget
 
 AGENT_FIELDS = {
@@ -49,6 +58,7 @@ AGENT_FIELDS = {
 
 KIND_FIELDS: dict[str, set[str]] = {
     "entry": {"entry_text", "entry_json", "attachments"},
+    "tasks_manager": {"tasks"},
     "prompt_reviewer": set(AGENT_FIELDS),
     "executor": set(AGENT_FIELDS),
     "task_reviewer": AGENT_FIELDS | {"criteria_node"},
@@ -175,6 +185,160 @@ class ExpandablePlainTextEdit(QPlainTextEdit):
         self.setFocus()
 
 
+class ManagedTaskEditor(QFrame):
+    changed = Signal()
+    remove_requested = Signal(object)
+
+    def __init__(self, task: dict[str, Any], index: int) -> None:
+        super().__init__()
+        self.task_id = str(task.get("id") or uuid4().hex)
+        self.index = index
+        self.setObjectName("managedTaskEditor")
+
+        self.heading = QLabel()
+        self.heading.setObjectName("managedTaskHeading")
+        self.remove_button = QToolButton()
+        self.remove_button.setObjectName("removeManagedTaskButton")
+        self.remove_button.setText("×")
+        self.remove_button.setToolTip("Видалити завдання")
+        self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self))
+        header = QHBoxLayout()
+        header.addWidget(self.heading, 1)
+        header.addWidget(self.remove_button)
+
+        self.prompt = ExpandablePlainTextEdit(f"Промпт завдання {index + 1}")
+        self.prompt.setMinimumHeight(105)
+        self.prompt.setPlaceholderText("Опишіть окреме завдання для AI-ланцюга")
+        self.prompt.setPlainText(str(task.get("prompt", "")))
+
+        self.attachments = AttachmentListWidget()
+        self.attachments.setMaximumHeight(180)
+        add_files = QPushButton("Додати файли")
+        add_files.clicked.connect(self._add_files)
+        remove_files = QPushButton("Прибрати")
+        remove_files.clicked.connect(self.attachments.remove_selected_paths)
+        file_buttons = QHBoxLayout()
+        file_buttons.addWidget(add_files)
+        file_buttons.addWidget(remove_files)
+        self.attachments.set_paths(
+            [str(path) for path in task.get("attachments", []) if str(path)]
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 7, 8, 8)
+        layout.setSpacing(6)
+        layout.addLayout(header)
+        layout.addWidget(self.prompt)
+        layout.addWidget(self.attachments)
+        layout.addLayout(file_buttons)
+
+        self.prompt.textChanged.connect(self._content_changed)
+        self.attachments.paths_changed.connect(self._content_changed)
+        self.refresh_heading(index)
+
+    def value(self) -> dict[str, Any]:
+        return {
+            "id": self.task_id,
+            "prompt": self.prompt.toPlainText(),
+            "attachments": self.attachments.paths(),
+        }
+
+    def refresh_heading(self, index: int) -> None:
+        self.index = index
+        self.prompt.field_title = f"Промпт завдання {index + 1}"
+        self.prompt.setAccessibleName(self.prompt.field_title)
+        self.prompt.expand_button.setToolTip(
+            f"Відкрити «{self.prompt.field_title}» на весь екран"
+        )
+        self.heading.setText(f"{index + 1}. {managed_task_title(self.value(), index)}")
+
+    def _content_changed(self) -> None:
+        self.refresh_heading(self.index)
+        self.changed.emit()
+
+    def _add_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Файли для завдання",
+            "",
+            "Усі файли (*);;Картинки (*.png *.jpg *.jpeg *.webp *.gif)",
+        )
+        self.attachments.add_paths([str(Path(path).resolve()) for path in paths])
+
+
+class ManagedTasksWidget(QWidget):
+    tasks_changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.loading = False
+        self.sections: list[ManagedTaskEditor] = []
+        self.sections_layout = QVBoxLayout()
+        self.sections_layout.setContentsMargins(0, 0, 0, 0)
+        self.sections_layout.setSpacing(8)
+        self.add_button = QPushButton("＋ Додати завдання")
+        self.add_button.setObjectName("addManagedTaskButton")
+        self.add_button.clicked.connect(self.add_task)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(self.sections_layout)
+        layout.addWidget(self.add_button)
+        self.set_tasks([])
+
+    def set_tasks(self, tasks: Any) -> None:
+        self.loading = True
+        try:
+            for section in self.sections:
+                self.sections_layout.removeWidget(section)
+                section.setParent(None)
+                section.deleteLater()
+            self.sections.clear()
+            for task in normalize_managed_tasks(tasks):
+                self._append_section(task)
+            self._refresh_sections()
+        finally:
+            self.loading = False
+
+    def tasks(self) -> list[dict[str, Any]]:
+        return [section.value() for section in self.sections]
+
+    def add_task(self) -> None:
+        self._append_section({"id": uuid4().hex, "prompt": "", "attachments": []})
+        self._refresh_sections()
+        self._emit_changed()
+
+    def _append_section(self, task: dict[str, Any]) -> None:
+        section = ManagedTaskEditor(task, len(self.sections))
+        section.changed.connect(self._section_changed)
+        section.remove_requested.connect(self._remove_section)
+        self.sections.append(section)
+        self.sections_layout.addWidget(section)
+
+    def _remove_section(self, section: ManagedTaskEditor) -> None:
+        if len(self.sections) <= 1 or section not in self.sections:
+            return
+        self.sections.remove(section)
+        self.sections_layout.removeWidget(section)
+        section.deleteLater()
+        self._refresh_sections()
+        self._emit_changed()
+
+    def _section_changed(self) -> None:
+        self._refresh_sections()
+        self._emit_changed()
+
+    def _refresh_sections(self) -> None:
+        multiple = len(self.sections) > 1
+        for index, section in enumerate(self.sections):
+            section.refresh_heading(index)
+            section.remove_button.setEnabled(multiple)
+
+    def _emit_changed(self) -> None:
+        if not self.loading:
+            self.tasks_changed.emit()
+
+
 class PopupComboBox(NoWheelComboBox):
     """Editable combo that also opens when its text area is clicked."""
 
@@ -244,6 +408,9 @@ class Inspector(QWidget):
         self.node_form.addRow("Вхідний промпт", self.entry_text)
         self.entry_json = self._plain(90, "Початковий JSON")
         self.node_form.addRow("Початковий JSON", self.entry_json)
+
+        self.tasks_editor = ManagedTasksWidget()
+        self.node_form.addRow("Завдання", self.tasks_editor)
 
         self.model_combo = PopupComboBox()
         self.model_combo.addItems(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
@@ -360,6 +527,7 @@ class Inspector(QWidget):
         fields = {
             "entry_text": self.entry_text,
             "entry_json": self.entry_json,
+            "tasks": self.tasks_editor,
             "model": self.model_combo,
             "reasoning": self.reasoning_combo,
             "sandbox": self.sandbox_combo,
@@ -391,6 +559,7 @@ class Inspector(QWidget):
         self.title_edit.textEdited.connect(self._save_node)
         self.entry_text.textChanged.connect(self._save_node)
         self.entry_json.textChanged.connect(self._save_node)
+        self.tasks_editor.tasks_changed.connect(self._save_node)
         self.model_combo.currentTextChanged.connect(self._save_node)
         self.reasoning_combo.currentTextChanged.connect(self._save_node)
         self.sandbox_combo.currentIndexChanged.connect(self._save_node)
@@ -561,6 +730,7 @@ class Inspector(QWidget):
         self.entry_json.setPlainText(
             json.dumps(node.config.get("json") or {}, ensure_ascii=False, indent=2)
         )
+        self.tasks_editor.set_tasks(node.config.get("tasks"))
         self.model_combo.setCurrentText(str(node.config.get("model", "gpt-5.6-terra")))
         self.reasoning_combo.setCurrentText(
             str(node.config.get("reasoning_effort", "medium"))
@@ -649,7 +819,12 @@ class Inspector(QWidget):
                 label.setVisible(key in visible)
 
     def _load_edge(self, edge: FlowEdge) -> None:
-        names = {"true": "TRUE", "false": "FALSE"}
+        names = {
+            "true": "TRUE",
+            "false": "FALSE",
+            "next": "NEXT",
+            "done": "DONE",
+        }
         self.edge_port.setText(names.get(edge.source_port, "звичайний вихід"))
         self.edge_label.setText(edge.label)
         self.source_path.setText(edge.source_path)
@@ -679,6 +854,8 @@ class Inspector(QWidget):
             if parsed is not None:
                 node.config["json"] = parsed
             node.config["attachments"] = self._list_values(self.attachments)
+        elif node.kind == "tasks_manager":
+            node.config["tasks"] = self.tasks_editor.tasks()
         elif node.kind == "result":
             node.config["template"] = self.template_edit.toPlainText()
             node.config["save_path"] = self.save_path.text().strip()
