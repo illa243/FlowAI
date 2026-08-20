@@ -258,6 +258,7 @@ class NodeItem(QGraphicsObject):
         self.attention = False
         self.blink_on = False
         self.task_states = self._configured_task_states()
+        self.port_counts: dict[str, int] = {}
         self.node_height = self._desired_height()
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsMovable
@@ -355,7 +356,8 @@ class NodeItem(QGraphicsObject):
     def refresh_port_labels(self, counts: dict[str, int] | None = None) -> None:
         if self.model.kind != "result":
             return
-        counts = counts or {}
+        if counts is not None:
+            self.port_counts = dict(counts)
         for name in ("true", "false"):
             port = self.output_ports.get(name)
             if port is None:
@@ -364,7 +366,7 @@ class NodeItem(QGraphicsObject):
             scene = self.scene()
             if isinstance(scene, FlowScene):
                 limit = scene.workflow.result_port_limit(self.model, name)
-            port.set_label(f"{name.upper()} {counts.get(name, 0)}/{limit}")
+            port.set_label(f"{name.upper()} {self.port_counts.get(name, 0)}/{limit}")
 
     def boundingRect(self) -> QRectF:
         return QRectF(0, 0, NODE_WIDTH, self.node_height)
@@ -950,6 +952,10 @@ class FlowScene(QGraphicsScene):
                 )
                 self.edge_items[edge.id] = item
                 self.addItem(item)
+        for result in workflow.nodes_of_kind("result"):
+            result_item = self.node_items.get(result.id)
+            if result_item is not None:
+                result_item.refresh_port_labels()
         self.loading = False
         self.selection_object_changed.emit(None)
 
@@ -1071,6 +1077,8 @@ class FlowScene(QGraphicsScene):
         item = EdgeItem(edge, source, target)
         self.edge_items[edge.id] = item
         self.addItem(item)
+        if source.model.kind == "result":
+            source.refresh_port_labels()
         self.clearSelection()
         item.setSelected(True)
         self.model_changed.emit()
@@ -1095,12 +1103,15 @@ class FlowScene(QGraphicsScene):
 
     def _remove_edge(self, edge_id: str) -> None:
         item = self.edge_items.pop(edge_id, None)
+        source = item.source if item is not None else None
         if item:
             item.detach()
             self.removeItem(item)
         self.workflow.edges = [
             edge for edge in self.workflow.edges if edge.id != edge_id
         ]
+        if source is not None and source.model.kind == "result":
+            source.refresh_port_labels()
 
     def _remove_node(self, node_id: str) -> None:
         for edge in list(self.workflow.edges):
@@ -1155,7 +1166,7 @@ class FlowScene(QGraphicsScene):
             item.refresh_task_config()
             if item.model.kind == "tasks_manager":
                 item.set_task_states(item._configured_task_states())
-            item.refresh_port_labels()
+            item.refresh_port_labels({})
         self._blink_timer.stop()
         self._running_timer.stop()
 

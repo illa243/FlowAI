@@ -1173,6 +1173,8 @@ def test_tasks_manager_canvas_has_next_done_ports_and_task_states() -> None:
     assert item.output_ports["next"].label == "NEXT"
     assert item.output_ports["done"].label == "DONE"
     assert item.boundingRect().height() > 130
+    result_item = scene.node_items[result.id]
+    assert result_item.output_ports["true"].label == "TRUE 0/3"
 
     scene.set_task_states(
         manager.id,
@@ -1187,7 +1189,11 @@ def test_tasks_manager_canvas_has_next_done_ports_and_task_states() -> None:
     assert scene._running_timer.isActive() is True
 
     scene.apply_port_counts({f"{result.id}:true": 1})
-    assert scene.node_items[result.id].output_ports["true"].label == "TRUE 1/3"
+    assert result_item.output_ports["true"].label == "TRUE 1/3"
+    result.config["false_limit"] = 5
+    scene.refresh_item(result)
+    assert result_item.output_ports["true"].label == "TRUE 1/3"
+    assert result_item.output_ports["false"].label == "FALSE 0/5"
 
 
 def test_parameters_title_and_model_field_open_the_model_list() -> None:

@@ -413,9 +413,7 @@ class Workflow:
                         f"У блоці «{node.title}» завдання {index + 1} не має промпту"
                     )
             if not self.outgoing(node.id, "next"):
-                errors.append(
-                    f"Блок «{node.title}» потребує з'єднання з виходу NEXT"
-                )
+                errors.append(f"Блок «{node.title}» потребує з'єднання з виходу NEXT")
             has_result_return = any(
                 edge.source_port == "true"
                 and (source := self.find(edge.source)) is not None
