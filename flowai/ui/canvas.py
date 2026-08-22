@@ -16,6 +16,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QFrame,
+    QGraphicsDropShadowEffect,
     QGraphicsItem,
     QGraphicsObject,
     QGraphicsPathItem,
@@ -26,23 +27,32 @@ from PySide6.QtWidgets import (
 )
 
 from ..models import (
+    DEFAULT_NODE_HEIGHT,
+    DEFAULT_NODE_WIDTH,
     DEFAULT_PORT,
     NODE_COLORS,
     SIDECAR_KINDS,
+    TERMINAL_KINDS,
     FlowEdge,
     FlowNode,
     Workflow,
     managed_task_title,
     normalize_managed_tasks,
 )
+from .design import COLORS, RADII, SHADOW_ALPHA, SHADOW_BLUR
+from .motion import pulse
 
-NODE_WIDTH = 220.0
-NODE_HEIGHT = 130.0
+NODE_WIDTH = DEFAULT_NODE_WIDTH
+NODE_HEIGHT = DEFAULT_NODE_HEIGHT
+MIN_NODE_WIDTH = 180.0
+MIN_NODE_HEIGHT = 130.0
+RESIZE_MARGIN = 9.0
 
 PORT_COLORS = {
     DEFAULT_PORT: "#A78BFA",
     "true": "#22C55E",
     "false": "#EF4444",
+    "exhausted": "#EAB308",
     "next": "#3B82F6",
     "done": "#22C55E",
 }
@@ -256,44 +266,61 @@ class NodeItem(QGraphicsObject):
         self.stage_total = 0
         self.stage_name = ""
         self.attention = False
-        self.blink_on = False
         self.task_states = self._configured_task_states()
         self.port_counts: dict[str, int] = {}
-        self.node_height = self._desired_height()
+        self.node_width = max(MIN_NODE_WIDTH, float(model.width))
+        self.node_height = max(self._minimum_height(), float(model.height))
+        self.model.width = round(self.node_width, 2)
+        self.model.height = round(self.node_height, 2)
+        self._resize_mode: str | None = None
+        self._resize_start_scene_pos = QPointF()
+        self._resize_start_size = QPointF()
+        self._resize_changed = False
+        self._move_changed = False
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsMovable
             | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
             | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
         )
+        self.setAcceptHoverEvents(True)
         self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
         self.setPos(model.x, model.y)
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(SHADOW_BLUR)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, SHADOW_ALPHA))
+        self.setGraphicsEffect(shadow)
 
         self.input_port: PortItem | None = None
+        self.input_ports: dict[str, PortItem] = {}
         self.output_ports: dict[str, PortItem] = {}
         if model.kind in SIDECAR_KINDS:
             return
 
         self.input_port = PortItem(self, "input")
-        self.input_port.setPos(0, self.node_height / 2)
-        if model.kind == "result":
+        self.input_ports = {"in": self.input_port}
+        if model.kind in TERMINAL_KINDS:
+            self.output_ports = {}
+        elif model.kind == "result":
             true_port = PortItem(self, "output", "true", "TRUE 0/1")
-            true_port.setPos(NODE_WIDTH, NODE_HEIGHT / 3)
             false_port = PortItem(self, "output", "false", "FALSE 0/3")
-            false_port.setPos(NODE_WIDTH, NODE_HEIGHT * 2 / 3)
-            self.output_ports = {"true": true_port, "false": false_port}
+            exhausted_port = PortItem(self, "output", "exhausted", "EXHAUSTED 2")
+            self.output_ports = {
+                "true": true_port,
+                "false": false_port,
+                "exhausted": exhausted_port,
+            }
             self.refresh_port_labels()
         elif model.kind == "tasks_manager":
             next_port = PortItem(self, "output", "next", "NEXT")
-            next_port.setPos(NODE_WIDTH, self.node_height / 3)
             done_port = PortItem(self, "output", "done", "DONE")
-            done_port.setPos(NODE_WIDTH, self.node_height * 2 / 3)
             self.output_ports = {"next": next_port, "done": done_port}
         else:
             port = PortItem(self, "output", DEFAULT_PORT)
-            port.setPos(NODE_WIDTH, self.node_height / 2)
             self.output_ports = {DEFAULT_PORT: port}
+        self._layout_ports()
 
-    def _configured_task_states(self) -> list[dict[str, str]]:
+    def _configured_task_states(self) -> list[dict[str, Any]]:
         if self.model.kind != "tasks_manager":
             return []
         return [
@@ -301,15 +328,18 @@ class NodeItem(QGraphicsObject):
                 "id": str(task["id"]),
                 "title": managed_task_title(task, index),
                 "status": "pending",
+                "seconds": 0.0,
             }
             for index, task in enumerate(
                 normalize_managed_tasks(self.model.config.get("tasks"))
             )
         ]
 
-    def _desired_height(self) -> float:
+    def _minimum_height(self) -> float:
+        if self.model.kind == "result":
+            return 170.0
         if self.model.kind != "tasks_manager":
-            return NODE_HEIGHT
+            return MIN_NODE_HEIGHT
         return max(150.0, 86.0 + len(self.task_states) * 22.0)
 
     def refresh_task_config(self) -> None:
@@ -321,32 +351,54 @@ class NodeItem(QGraphicsObject):
             previous = states_by_id.get(item["id"])
             if previous is not None:
                 item["status"] = str(previous.get("status", "pending"))
-        height = max(150.0, 86.0 + len(configured) * 22.0)
-        if height != self.node_height:
-            self.prepareGeometryChange()
-            self.node_height = height
+                item["seconds"] = float(previous.get("seconds", 0.0) or 0.0)
         self.task_states = configured
+        self.resize_to(
+            self.node_width,
+            max(self.node_height, self._minimum_height()),
+            notify=False,
+        )
+        self.update()
+
+    def resize_to(self, width: float, height: float, *, notify: bool = True) -> bool:
+        """Resize this node, persist the dimensions, and keep its edges attached."""
+        new_width = max(MIN_NODE_WIDTH, float(width))
+        new_height = max(self._minimum_height(), float(height))
+        if (
+            math.isclose(new_width, self.node_width, abs_tol=0.01)
+            and math.isclose(new_height, self.node_height, abs_tol=0.01)
+        ):
+            return False
+        self.prepareGeometryChange()
+        self.node_width = new_width
+        self.node_height = new_height
+        self.model.width = round(new_width, 2)
+        self.model.height = round(new_height, 2)
         self._layout_ports()
         for edge in self.edges:
             edge.update_path()
         self.update()
+        scene = self.scene()
+        if notify and isinstance(scene, FlowScene) and not scene.loading:
+            scene.model_changed.emit()
+        return True
 
     def _layout_ports(self) -> None:
         if self.input_port is not None:
             self.input_port.setPos(0, self.node_height / 2)
         if self.model.kind == "tasks_manager":
             if next_port := self.output_ports.get("next"):
-                next_port.setPos(NODE_WIDTH, self.node_height / 3)
+                next_port.setPos(self.node_width, self.node_height / 3)
             if done_port := self.output_ports.get("done"):
-                done_port.setPos(NODE_WIDTH, self.node_height * 2 / 3)
+                done_port.setPos(self.node_width, self.node_height * 2 / 3)
         elif self.model.kind == "result":
-            if true_port := self.output_ports.get("true"):
-                true_port.setPos(NODE_WIDTH, self.node_height / 3)
-            if false_port := self.output_ports.get("false"):
-                false_port.setPos(NODE_WIDTH, self.node_height * 2 / 3)
+            for index, name in enumerate(("true", "false", "exhausted"), start=1):
+                port = self.output_ports.get(name)
+                if port is not None:
+                    port.setPos(self.node_width, self.node_height * index / 4)
         else:
             for port in self.output_ports.values():
-                port.setPos(NODE_WIDTH, self.node_height / 2)
+                port.setPos(self.node_width, self.node_height / 2)
 
     def output_port_item(self, name: str) -> PortItem | None:
         if name in self.output_ports:
@@ -367,38 +419,49 @@ class NodeItem(QGraphicsObject):
             if isinstance(scene, FlowScene):
                 limit = scene.workflow.result_port_limit(self.model, name)
             port.set_label(f"{name.upper()} {self.port_counts.get(name, 0)}/{limit}")
+        exhausted = self.output_ports.get("exhausted")
+        if exhausted is not None:
+            limit = int(self.model.config.get("task_attempt_limit", 2))
+            exhausted.set_label(f"EXHAUSTED {limit}")
 
     def boundingRect(self) -> QRectF:
-        return QRectF(0, 0, NODE_WIDTH, self.node_height)
+        return QRectF(0, 0, self.node_width, self.node_height)
 
     def paint(self, painter: QPainter, option: Any, widget: Any = None) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        background = QColor("#172033")
-        if self.attention and self.blink_on:
-            border = QColor("#FBBF24")
-            width = 3
+        background = QColor(COLORS["surface_raised"])
+        if self.attention:
+            wave = self._running_pulse()
+            border = self._blend_color(
+                QColor(COLORS["border"]), QColor(COLORS["warning"]), wave
+            )
+            width = 1.5 + 1.5 * wave
         elif self.status == "running":
-            pulse = self._running_pulse()
-            border = QColor(34, 197, 94, round(125 + 120 * pulse))
-            width = 1.5 + 1.5 * pulse
+            wave = self._running_pulse()
+            border = self._blend_color(
+                QColor(COLORS["border"]),
+                QColor(NODE_COLORS.get(self.model.kind, COLORS["accent"])),
+                wave,
+            )
+            width = 1.5 + 1.5 * wave
             background = self._blend_color(
-                QColor("#172033"), QColor("#14532D"), 0.12 + 0.20 * pulse
+                QColor(COLORS["surface_raised"]), border, 0.08 + 0.12 * wave
             )
         elif self.isSelected():
-            border = QColor("#A78BFA")
+            border = QColor(COLORS["focus"])
             width = 2
         else:
-            border = QColor("#334155")
+            border = QColor(COLORS["border"])
             width = 1
         painter.setPen(QPen(border, width))
         painter.setBrush(background)
-        painter.drawRoundedRect(self.boundingRect(), 10, 10)
+        painter.drawRoundedRect(self.boundingRect(), RADII["md"], RADII["md"])
 
-        header = QRectF(0, 0, NODE_WIDTH, 36)
+        header = QRectF(0, 0, self.node_width, 36)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(NODE_COLORS.get(self.model.kind, "#64748B")))
-        painter.drawRoundedRect(header, 10, 10)
-        painter.drawRect(QRectF(0, 26, NODE_WIDTH, 10))
+        painter.drawRoundedRect(header, RADII["md"], RADII["md"])
+        painter.drawRect(QRectF(0, 26, self.node_width, 10))
 
         font = painter.font()
         font.setBold(False)
@@ -409,7 +472,7 @@ class NodeItem(QGraphicsObject):
         if self.status in {"running", "waiting"} and self.stage_total:
             progress = f" · {self.stage_current}/{self.stage_total}"
         painter.drawText(
-            QRectF(NODE_WIDTH - 104, 0, 92, 36),
+            QRectF(self.node_width - 104, 0, 92, 36),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
             f"{self.model.short_id}{progress}",
         )
@@ -419,13 +482,14 @@ class NodeItem(QGraphicsObject):
         font.setPointSize(10)
         painter.setFont(font)
         painter.drawText(
-            QRectF(14, 0, NODE_WIDTH - 118, 36),
+            QRectF(14, 0, self.node_width - 118, 36),
             Qt.AlignmentFlag.AlignVCenter,
             self.model.title,
         )
 
         if self.model.kind == "tasks_manager":
             self._paint_tasks(painter)
+            self._paint_resize_handle(painter)
             return
 
         painter.setPen(QColor("#94A3B8"))
@@ -433,7 +497,7 @@ class NodeItem(QGraphicsObject):
         font.setPointSize(8)
         painter.setFont(font)
         painter.drawText(
-            QRectF(14, 42, NODE_WIDTH - 28, 32),
+            QRectF(14, 42, self.node_width - 28, 32),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
             self._subtitle(),
         )
@@ -456,17 +520,18 @@ class NodeItem(QGraphicsObject):
             stage_color.setAlpha(round(145 + 110 * self._running_pulse()))
         painter.setPen(stage_color)
         painter.drawText(
-            QRectF(28, 70, NODE_WIDTH - 40, 24),
+            QRectF(28, 70, self.node_width - 40, 24),
             Qt.AlignmentFlag.AlignVCenter,
             self.stage_name if stage_active else self.status,
         )
         painter.setPen(QColor("#CBD5E1"))
         for index, line in enumerate(self._time_lines()):
             painter.drawText(
-                QRectF(28, 92 + index * 15, NODE_WIDTH - 40, 15),
+                QRectF(28, 92 + index * 15, self.node_width - 40, 15),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                 line,
             )
+        self._paint_resize_handle(painter)
 
     def _paint_tasks(self, painter: QPainter) -> None:
         font = painter.font()
@@ -486,40 +551,71 @@ class NodeItem(QGraphicsObject):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 angle = -round(time.monotonic() * 300 * 16)
                 painter.drawArc(QRectF(13, y + 2, 13, 13), angle, 250 * 16)
+            elif status == "failed":
+                painter.setPen(QPen(QColor("#EF4444"), 2.4))
+                painter.drawLine(QPointF(14, y + 4), QPointF(24, y + 13))
+                painter.drawLine(QPointF(24, y + 4), QPointF(14, y + 13))
             else:
                 painter.setPen(QPen(QColor("#64748B"), 1.5))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawEllipse(QRectF(16, y + 5, 7, 7))
-            painter.setPen(
-                QColor("#E5E7EB") if status == "running" else QColor("#CBD5E1")
-            )
+            if status == "running":
+                painter.setPen(QColor("#E5E7EB"))
+            elif status == "failed":
+                painter.setPen(QColor("#FCA5A5"))
+            else:
+                painter.setPen(QColor("#CBD5E1"))
             title = metrics.elidedText(
                 str(task.get("title", f"Завдання {index + 1}")),
                 Qt.TextElideMode.ElideRight,
-                round(NODE_WIDTH - 48),
+                round(self.node_width - 116),
             )
             painter.drawText(
-                QRectF(32, y, NODE_WIDTH - 44, 18),
+                QRectF(32, y, self.node_width - 44, 18),
                 Qt.AlignmentFlag.AlignVCenter,
                 title,
             )
+            seconds = float(task.get("seconds", 0.0) or 0.0)
+            if seconds > 0:
+                painter.setPen(QColor("#94A3B8"))
+                painter.drawText(
+                    QRectF(self.node_width - 76, y, 62, 18),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                    self._format_seconds(seconds),
+                )
 
         completed = sum(
             1 for task in self.task_states if task.get("status") == "completed"
         )
+        failed = sum(1 for task in self.task_states if task.get("status") == "failed")
+        summary = f"Виконано {completed}/{len(self.task_states)}"
+        if failed:
+            summary += f" · провалено {failed}"
         footer_y = self.node_height - 28
         painter.setPen(QColor("#94A3B8"))
         painter.drawText(
-            QRectF(14, footer_y, NODE_WIDTH - 90, 18),
+            QRectF(14, footer_y, self.node_width - 90, 18),
             Qt.AlignmentFlag.AlignVCenter,
-            f"Виконано {completed}/{len(self.task_states)}",
+            summary,
+        )
+        total = sum(
+            float(task.get("seconds", 0.0) or 0.0) for task in self.task_states
         )
         painter.setPen(QColor("#CBD5E1"))
         painter.drawText(
-            QRectF(NODE_WIDTH - 92, footer_y, 78, 18),
+            QRectF(self.node_width - 116, footer_y, 102, 18),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
-            self._time_lines()[-1],
+            f"Σ {self._format_seconds(total)}" if total > 0 else "Σ —",
         )
+
+    def _paint_resize_handle(self, painter: QPainter) -> None:
+        if not self.isSelected() and self._resize_mode is None:
+            return
+        painter.setPen(QPen(QColor("#CBD5E1"), 1.5))
+        right = self.node_width - 5.0
+        bottom = self.node_height - 5.0
+        painter.drawLine(QPointF(right - 8, bottom), QPointF(right, bottom - 8))
+        painter.drawLine(QPointF(right - 4, bottom), QPointF(right, bottom - 4))
 
     @staticmethod
     def _blend_color(start: QColor, end: QColor, amount: float) -> QColor:
@@ -532,9 +628,7 @@ class NodeItem(QGraphicsObject):
 
     @staticmethod
     def _running_pulse(now: float | None = None) -> float:
-        """Плавна хвиля 0..1 з періодом приблизно 1,6 секунди."""
-        moment = time.monotonic() if now is None else now
-        return (math.sin(moment * math.tau / 1.6) + 1.0) / 2.0
+        return pulse(now)
 
     def elapsed_seconds(self, now: float | None = None) -> float:
         elapsed = self.duration_seconds
@@ -604,15 +698,110 @@ class NodeItem(QGraphicsObject):
                 edge.update_path()
             scene = self.scene()
             if isinstance(scene, FlowScene) and not scene.loading:
-                scene.model_changed.emit()
+                if scene.is_node_interaction_active():
+                    self._move_changed = True
+                else:
+                    scene.model_changed.emit()
         return super().itemChange(change, value)
 
+    def _resize_mode_at(self, position: QPointF) -> str | None:
+        near_right = self.node_width - RESIZE_MARGIN <= position.x() <= self.node_width
+        near_bottom = (
+            self.node_height - RESIZE_MARGIN <= position.y() <= self.node_height
+        )
+        if near_right and near_bottom:
+            return "both"
+        if near_right:
+            return "width"
+        if near_bottom:
+            return "height"
+        return None
+
+    def _show_resize_cursor(self, mode: str | None) -> None:
+        cursors = {
+            "both": Qt.CursorShape.SizeFDiagCursor,
+            "width": Qt.CursorShape.SizeHorCursor,
+            "height": Qt.CursorShape.SizeVerCursor,
+        }
+        cursor = cursors.get(mode)
+        if cursor is None:
+            self.unsetCursor()
+        else:
+            self.setCursor(cursor)
+
+    def hoverMoveEvent(self, event: Any) -> None:
+        if self._resize_mode is None:
+            self._show_resize_cursor(self._resize_mode_at(event.pos()))
+        super().hoverMoveEvent(event)
+
+    def hoverLeaveEvent(self, event: Any) -> None:
+        if self._resize_mode is None:
+            self.unsetCursor()
+        super().hoverLeaveEvent(event)
+
     def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            scene = self.scene()
+            if isinstance(scene, FlowScene):
+                scene.begin_node_interaction(self)
+            resize_mode = self._resize_mode_at(event.pos())
+            if resize_mode is not None:
+                self._resize_mode = resize_mode
+                self._resize_start_scene_pos = event.scenePos()
+                self._resize_start_size = QPointF(
+                    self.node_width, self.node_height
+                )
+                self._resize_changed = False
+                self.setSelected(True)
+                self._show_resize_cursor(resize_mode)
+                event.accept()
+                return
         if self.attention and event.button() == Qt.MouseButton.LeftButton:
             scene = self.scene()
             if isinstance(scene, FlowScene):
                 scene.attention_clicked.emit(self.model.id)
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        if self._resize_mode is not None:
+            delta = event.scenePos() - self._resize_start_scene_pos
+            width = self._resize_start_size.x()
+            height = self._resize_start_size.y()
+            if self._resize_mode in {"width", "both"}:
+                width += delta.x()
+            if self._resize_mode in {"height", "both"}:
+                height += delta.y()
+            self._resize_changed = (
+                self.resize_to(width, height, notify=False) or self._resize_changed
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._resize_mode is not None
+        ):
+            changed = self._resize_changed
+            self._resize_mode = None
+            self._resize_changed = False
+            self._show_resize_cursor(self._resize_mode_at(event.pos()))
+            if changed:
+                scene = self.scene()
+                if isinstance(scene, FlowScene) and not scene.loading:
+                    scene.model_changed.emit()
+            scene = self.scene()
+            if isinstance(scene, FlowScene):
+                scene.end_node_interaction(self)
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            scene = self.scene()
+            if isinstance(scene, FlowScene):
+                scene.end_node_interaction(self)
 
     def set_status(self, status: str) -> None:
         self.status = status
@@ -638,14 +827,23 @@ class NodeItem(QGraphicsObject):
 
     def set_attention(self, attention: bool) -> None:
         self.attention = attention
-        self.blink_on = attention
         self.update()
+
+    def set_shadow_enabled(self, enabled: bool) -> None:
+        """Увімкнути або вимкнути тінь ноди.
+
+        Розмиття тіні перераховується на кожен кадр, тож під час перетягування
+        воно подвоює вартість малювання й нода починає відставати від курсора.
+        """
+        effect = self.graphicsEffect()
+        if effect is not None and effect.isEnabled() != enabled:
+            effect.setEnabled(enabled)
 
     def set_task_states(self, states: list[dict[str, Any]]) -> None:
         if self.model.kind != "tasks_manager":
             return
         known = {str(item.get("id")): item for item in self.task_states}
-        merged: list[dict[str, str]] = []
+        merged: list[dict[str, Any]] = []
         for index, raw in enumerate(states):
             task_id = str(raw.get("id", ""))
             previous = known.get(task_id, {})
@@ -658,6 +856,7 @@ class NodeItem(QGraphicsObject):
                         or f"Завдання {index + 1}"
                     ),
                     "status": str(raw.get("status", "pending")),
+                    "seconds": float(raw.get("seconds", 0.0) or 0.0),
                 }
             )
         if merged:
@@ -743,6 +942,7 @@ class EdgeItem(QGraphicsPathItem):
         self.model = model
         self.source = source
         self.target = target
+        self.is_active = False
         self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setZValue(-1)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -762,7 +962,7 @@ class EdgeItem(QGraphicsPathItem):
     def _color(self) -> QColor:
         if self.isSelected():
             return QColor("#A78BFA")
-        if self.model.source_port in {"true", "false"}:
+        if self.model.source_port in PORT_COLORS:
             return QColor(PORT_COLORS[self.model.source_port]).darker(115)
         return QColor("#64748B")
 
@@ -794,7 +994,14 @@ class EdgeItem(QGraphicsPathItem):
     def paint(self, painter: QPainter, option: Any, widget: Any = None) -> None:
         color = self._color()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(color, 3 if self.isSelected() else 2))
+        if self.is_active:
+            pen = QPen(color.lighter(130), 2.6)
+            pen.setStyle(Qt.PenStyle.CustomDashLine)
+            pen.setDashPattern([6, 5])
+            pen.setDashOffset((time.monotonic() * 14) % 11)
+            painter.setPen(pen)
+        else:
+            painter.setPen(QPen(color, 3 if self.isSelected() else 2))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(self.path())
 
@@ -812,6 +1019,11 @@ class EdgeItem(QGraphicsPathItem):
         )
         painter.setBrush(color)
         painter.drawPolygon(QPolygonF([end, p1, p2]))
+
+    def set_active(self, active: bool) -> None:
+        if self.is_active != active:
+            self.is_active = active
+            self.update()
 
     def shape(self) -> QPainterPath:
         stroker = QPainterPathStroker()
@@ -921,25 +1133,28 @@ class FlowScene(QGraphicsScene):
         self.connection_preview: ConnectionPreviewItem | None = None
         self._preview_source: tuple[NodeItem, str] | None = None
         self._highlighted_input: PortItem | None = None
+        self._interacting_node: NodeItem | None = None
+        self._shadowed_items: list[NodeItem] = []
+        self._pending_selection: FlowNode | FlowEdge | None = None
+        self._selection_pending = False
         self.loading = False
         self.setSceneRect(-5000, -5000, 10000, 10000)
         self.selectionChanged.connect(self._selection_changed)
-        self._blink_timer = QTimer(self)
-        self._blink_timer.setInterval(550)
-        self._blink_timer.timeout.connect(self._toggle_blink)
         self._running_timer = QTimer(self)
-        self._running_timer.setInterval(100)
+        self._running_timer.setInterval(16)
         self._running_timer.timeout.connect(self._update_running_nodes)
 
     def set_workflow(self, workflow: Workflow) -> None:
         self.loading = True
+        self._interacting_node = None
+        self._shadowed_items = []
+        self._selection_pending = False
         self.cancel_connection_preview()
         self.clear()
         self.workflow = workflow
         self.node_items.clear()
         self.edge_items.clear()
         self.pending_source = None
-        self._blink_timer.stop()
         self._running_timer.stop()
         for node in workflow.nodes:
             item = NodeItem(node)
@@ -1123,21 +1338,67 @@ class FlowScene(QGraphicsScene):
         self.workflow.remove_node(node_id)
 
     def _selection_changed(self) -> None:
+        selected_object: FlowNode | FlowEdge | None = None
         selected = self.selectedItems()
         if len(selected) == 1:
             item = selected[0]
             if isinstance(item, NodeItem):
                 if item.attention:
                     self.attention_clicked.emit(item.model.id)
-                self.selection_object_changed.emit(item.model)
-                return
-            if isinstance(item, EdgeItem):
-                self.selection_object_changed.emit(item.model)
-                return
-            if isinstance(item, EdgeControlPointItem):
-                self.selection_object_changed.emit(item.edge.model)
-                return
-        self.selection_object_changed.emit(None)
+                selected_object = item.model
+            elif isinstance(item, EdgeItem):
+                selected_object = item.model
+            elif isinstance(item, EdgeControlPointItem):
+                selected_object = item.edge.model
+        if self._interacting_node is not None:
+            self._pending_selection = selected_object
+            self._selection_pending = True
+            return
+        self.selection_object_changed.emit(selected_object)
+
+    def begin_node_interaction(self, item: NodeItem) -> None:
+        """Defer expensive selection consumers while a node may start moving.
+
+        Тінь ноди — це розмиття, яке Qt перераховує на кожному кадрі, поки
+        нода рухається. На час жесту вона вимикається в усіх нод, які поїдуть
+        разом із курсором, і повертається одразу після відпускання миші.
+        """
+        self._interacting_node = item
+        self._shadowed_items = [
+            node
+            for node in self.node_items.values()
+            if node is item or node.isSelected()
+        ]
+        for node in self._shadowed_items:
+            node.set_shadow_enabled(False)
+
+    def is_node_interaction_active(self) -> bool:
+        """Чи триває жест перетягування — байдуже, за яку ноду тягнуть.
+
+        Qt рухає одразу всі вибрані ноди, тож відкладати треба зміни від
+        кожної з них. Якщо питати лише про ноду під курсором, решта вибраних
+        емітить model_changed на кожну подію руху миші.
+        """
+        return self._interacting_node is not None
+
+    def end_node_interaction(self, item: NodeItem) -> None:
+        """Flush one model update and the pending Inspector selection."""
+        if self._interacting_node is not item:
+            return
+        self._interacting_node = None
+        for node in self._shadowed_items:
+            node.set_shadow_enabled(True)
+        self._shadowed_items = []
+        moved = [node for node in self.node_items.values() if node._move_changed]
+        for node in moved:
+            node._move_changed = False
+        if moved and not self.loading:
+            self.model_changed.emit()
+        if self._selection_pending:
+            selected = self._pending_selection
+            self._pending_selection = None
+            self._selection_pending = False
+            self.selection_object_changed.emit(selected)
 
     def refresh_item(self, model: FlowNode | FlowEdge) -> None:
         if isinstance(model, FlowNode):
@@ -1167,7 +1428,6 @@ class FlowScene(QGraphicsScene):
             if item.model.kind == "tasks_manager":
                 item.set_task_states(item._configured_task_states())
             item.refresh_port_labels({})
-        self._blink_timer.stop()
         self._running_timer.stop()
 
     def set_node_status(self, node_id: str, status: str) -> None:
@@ -1225,10 +1485,7 @@ class FlowScene(QGraphicsScene):
         if item is None:
             return
         item.set_attention(attention)
-        if attention:
-            self._blink_timer.start()
-        elif not any(node.attention for node in self.node_items.values()):
-            self._blink_timer.stop()
+        self._sync_running_timer()
 
     def apply_port_counts(self, counts: dict[str, int]) -> None:
         """counts: ключі виду "<node_id>:<port>" із чекпоінта запуску."""
@@ -1249,17 +1506,16 @@ class FlowScene(QGraphicsScene):
         for node_id, states in task_states.items():
             self.set_task_states(node_id, states)
 
-    def _toggle_blink(self) -> None:
-        for item in self.node_items.values():
-            if item.attention:
-                item.blink_on = not item.blink_on
-                item.update()
+    def set_active_edge(self, edge_id: str) -> None:
+        for identifier, item in self.edge_items.items():
+            item.set_active(identifier == edge_id)
+        self._sync_running_timer()
 
     def _sync_running_timer(self) -> None:
         running = any(
-            item.status == "running" or item.has_active_task()
+            item.status == "running" or item.has_active_task() or item.attention
             for item in self.node_items.values()
-        )
+        ) or any(item.is_active for item in self.edge_items.values())
         if running and not self._running_timer.isActive():
             self._running_timer.start()
         elif not running:
@@ -1267,7 +1523,10 @@ class FlowScene(QGraphicsScene):
 
     def _update_running_nodes(self) -> None:
         for item in self.node_items.values():
-            if item.status == "running" or item.has_active_task():
+            if item.status == "running" or item.has_active_task() or item.attention:
+                item.update()
+        for item in self.edge_items.values():
+            if item.is_active:
                 item.update()
 
 

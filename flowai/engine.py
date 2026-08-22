@@ -12,16 +12,20 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from .codex_adapter import CodexAdapter
+from .calibration import parse_report, save_report
+from .codex_adapter import CodexAdapter, TurnInterrupted
 from .models import (
     AGENT_KINDS,
     DEFAULT_PORT,
+    NEVER_SEEDED,
     RESULT_PORTS,
     FlowNode,
     Workflow,
     managed_task_title,
     normalize_managed_tasks,
 )
+from .project_layout import ARTIFACTS_DIR, REPORTS_DIR, local_output_path
+from .skills import catalogue_text, list_skills, skills_used
 from .templating import (
     extract_json,
     render_template,
@@ -112,6 +116,9 @@ class RunCheckpoint:
     protocol_records: dict[str, list[str]] = field(default_factory=dict)
     protocol_path: str = ""
     task_progress: dict[str, dict[str, Any]] = field(default_factory=dict)
+    task_attempts: dict[str, int] = field(default_factory=dict)
+    calibration_attempts: dict[str, int] = field(default_factory=dict)
+    protocol_steps: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -128,6 +135,9 @@ class RunCheckpoint:
             "protocol_records": self.protocol_records,
             "protocol_path": self.protocol_path,
             "task_progress": self.task_progress,
+            "task_attempts": dict(self.task_attempts),
+            "calibration_attempts": dict(self.calibration_attempts),
+            "protocol_steps": self.protocol_steps,
         }
 
     @classmethod
@@ -146,6 +156,17 @@ class RunCheckpoint:
             protocol_records=dict(raw.get("protocol_records") or {}),
             protocol_path=str(raw.get("protocol_path", "")),
             task_progress=dict(raw.get("task_progress") or {}),
+            task_attempts={
+                str(key): int(value)
+                for key, value in dict(raw.get("task_attempts") or {}).items()
+            },
+            calibration_attempts={
+                str(key): int(value)
+                for key, value in dict(
+                    raw.get("calibration_attempts") or {}
+                ).items()
+            },
+            protocol_steps=dict(raw.get("protocol_steps") or {}),
         )
 
     def node_results(self) -> dict[str, NodeResult]:
@@ -204,18 +225,12 @@ class WorkflowRunner:
         self._emit("run_cancel_requested", message="Запит на зупинку отримано")
 
     def pause(self, reason: str = "Систему призупинено") -> None:
+        """Поставити бар'єр між нодами, не перериваючи активний хід агента."""
         if self._stop.is_set() or not self._resume_event.is_set():
             return
         with self._control_lock:
             self._pause_generation += 1
             self._resume_event.clear()
-            codex = self._active_codex
-        if codex is not None:
-            threading.Thread(
-                target=codex.cancel_active,
-                name="FlowAI-Codex-Pause",
-                daemon=True,
-            ).start()
         self._emit("run_paused", message=reason)
 
     def resume(self, reason: str = "Роботу системи відновлено") -> None:
@@ -226,8 +241,23 @@ class WorkflowRunner:
 
     def update_node_config(self, node_id: str, updates: dict[str, Any]) -> bool:
         """Apply explicitly safe live settings to the runner snapshot."""
-        allowed = {"true_limit", "false_limit", "wait_for_confirmation"}
-        clean = {key: value for key, value in updates.items() if key in allowed}
+        allowed = {
+            "true_limit",
+            "false_limit",
+            "task_attempt_limit",
+            "wait_for_confirmation",
+        }
+        clean: dict[str, Any] = {}
+        for key, value in updates.items():
+            if key not in allowed:
+                continue
+            if key in {"true_limit", "false_limit", "task_attempt_limit"}:
+                try:
+                    clean[key] = max(1, int(value))
+                except (TypeError, ValueError):
+                    continue
+            else:
+                clean[key] = bool(value)
         node = self.workflow.find(node_id)
         if node is None or node.kind != "result" or not clean:
             return False
@@ -262,6 +292,19 @@ class WorkflowRunner:
     # Основний цикл
     # ------------------------------------------------------------------
 
+    def _initial_queue(self) -> list[str]:
+        """Повернути стартові ноди, явно виключивши Calibration Stop."""
+        return [
+            node.id
+            for node in self.workflow.routed_nodes()
+            if node.kind not in NEVER_SEEDED
+            and not any(
+                (source := self.workflow.find(edge.source)) is not None
+                and source.kind != "result"
+                for edge in self.workflow.incoming(node.id)
+            )
+        ]
+
     def run(self) -> RunCheckpoint:
         errors = self.workflow.validate()
         if errors:
@@ -278,15 +321,7 @@ class WorkflowRunner:
 
         reviewer = next(iter(self.workflow.nodes_of_kind("work_reviewer")), None)
         if not self.checkpoint.started:
-            self.checkpoint.queue = [
-                node.id
-                for node in self.workflow.routed_nodes()
-                if not any(
-                    (source := self.workflow.find(edge.source)) is not None
-                    and source.kind != "result"
-                    for edge in self.workflow.incoming(node.id)
-                )
-            ]
+            self.checkpoint.queue = self._initial_queue()
             self.checkpoint.started = True
         if reviewer is not None:
             self._start_protocol(reviewer)
@@ -429,7 +464,7 @@ class WorkflowRunner:
                 self._emit("run_cancelled", message="Flow зупинено")
             if not paused and status != "cancelled":
                 if self.protocol is not None:
-                    self.protocol.finish(status)
+                    self.protocol.finish(status, self._failed_task_titles())
                 if reviewer is not None and codex is not None:
                     try:
                         self._run_work_reviewer(reviewer, workspace, codex, status)
@@ -510,28 +545,47 @@ class WorkflowRunner:
     @staticmethod
     def _existing_input_files(value: Any, workspace: Path) -> list[str]:
         found: list[str] = []
+        found_keys: set[str] = set()
+        visited_containers: set[int] = set()
 
         def visit(item: Any) -> None:
             if isinstance(item, dict):
+                identity = id(item)
+                if identity in visited_containers:
+                    return
+                visited_containers.add(identity)
                 for nested in item.values():
                     visit(nested)
                 return
             if isinstance(item, (list, tuple, set)):
+                identity = id(item)
+                if identity in visited_containers:
+                    return
+                visited_containers.add(identity)
                 for nested in item:
                     visit(nested)
                 return
-            if not isinstance(item, str) or not item.strip() or len(item) > 2048:
+            if not isinstance(item, str):
                 return
-            candidate = Path(item.strip()).expanduser()
+            raw_path = item.strip()
+            if (
+                not raw_path
+                or len(raw_path) > 2048
+                or any(character in raw_path for character in ("\x00", "\r", "\n"))
+            ):
+                return
+            candidate = Path(raw_path).expanduser()
             if not candidate.is_absolute():
                 candidate = workspace / candidate
             try:
-                resolved = candidate.resolve()
-                exists = resolved.is_file()
-            except OSError:
+                candidate = candidate.absolute()
+                exists = candidate.is_file()
+            except (OSError, RuntimeError):
                 return
-            path = str(resolved)
-            if exists and path not in found:
+            path = str(candidate)
+            key = path.casefold()
+            if exists and key not in found_keys:
+                found_keys.add(key)
                 found.append(path)
 
         visit(value)
@@ -557,6 +611,16 @@ class WorkflowRunner:
                 raise
             except RunCancelled:
                 raise
+            except TurnInterrupted:
+                if self._stop.is_set():
+                    raise RunCancelled("Flow зупинено")
+                self._wait_until_resumed()
+                self._emit(
+                    "node_retry",
+                    node=node,
+                    message="Хід агента обірвався — повторюємо в тому ж треді",
+                )
+                continue
             except Exception as exc:
                 if self._stop.is_set():
                     raise RunCancelled("Flow зупинено") from exc
@@ -595,6 +659,8 @@ class WorkflowRunner:
             "inputs": inputs,
             **inputs,
             "workflow": {"name": self.workflow.name},
+            "grill_summary": self.workflow.grill_summary
+            or "Окремих домовленостей не було.",
             "node_iteration": self.checkpoint.iterations.get(node.id, 0) + 1,
         }
 
@@ -618,6 +684,9 @@ class WorkflowRunner:
             self._stage(node, 4, "Перевірка умови розгалуження")
             return self._execute_result(node, inputs, context, workspace)
 
+        if node.kind == "calibrator":
+            return self._execute_calibrator(node, inputs, context, workspace, codex)
+
         if node.kind in AGENT_KINDS:
             return self._execute_agent(node, inputs, context, workspace, codex)
 
@@ -628,43 +697,80 @@ class WorkflowRunner:
         valid_ids = {str(task["id"]) for task in tasks}
         progress = self.checkpoint.task_progress.setdefault(
             node.id,
-            {"active_task_id": "", "completed_task_ids": []},
+            {
+                "active_task_id": "",
+                "completed_task_ids": [],
+                "failed_task_ids": [],
+            },
         )
+        times: dict[str, dict[str, float]] = progress.setdefault("times", {})
+        now = time.time()
+
+        def _close_task(task_id: str) -> None:
+            record = times.get(task_id)
+            if not record or record.get("finished"):
+                return
+            record["finished"] = now
+            record["seconds"] = max(
+                0.0, now - float(record.get("started", now))
+            )
+
+        failed = [
+            str(task_id)
+            for task_id in progress.get("failed_task_ids", [])
+            if str(task_id) in valid_ids
+        ]
         completed = [
             str(task_id)
             for task_id in progress.get("completed_task_ids", [])
-            if str(task_id) in valid_ids
+            if str(task_id) in valid_ids and str(task_id) not in failed
         ]
         active_id = str(progress.get("active_task_id", ""))
-        if active_id in valid_ids and active_id not in completed:
+        if active_id in failed:
+            _close_task(active_id)
+        elif active_id in valid_ids and active_id not in completed:
             completed.append(active_id)
+            _close_task(active_id)
 
+        finished = set(completed) | set(failed)
         active_task: dict[str, Any] | None = next(
-            (task for task in tasks if str(task["id"]) not in completed),
+            (task for task in tasks if str(task["id"]) not in finished),
             None,
         )
         active_id = str(active_task["id"]) if active_task is not None else ""
+        if active_id and active_id not in times:
+            times[active_id] = {"started": now, "finished": 0.0, "seconds": 0.0}
         progress["active_task_id"] = active_id
         progress["completed_task_ids"] = completed
+        progress["failed_task_ids"] = failed
 
         states = []
         for index, task in enumerate(tasks):
             task_id = str(task["id"])
             status = (
-                "completed"
+                "failed"
+                if task_id in failed
+                else "completed"
                 if task_id in completed
                 else "running"
                 if task_id == active_id
                 else "pending"
             )
+            record = times.get(task_id, {})
+            if status == "running" and record:
+                seconds = max(0.0, now - float(record.get("started", now)))
+            else:
+                seconds = float(record.get("seconds", 0.0))
             states.append(
                 {
                     "id": task_id,
                     "title": managed_task_title(task, index),
                     "status": status,
+                    "seconds": round(seconds, 3),
                 }
             )
 
+        total_seconds = round(sum(item["seconds"] for item in states), 3)
         branch = "next" if active_task is not None else "done"
         message = (
             f"Активовано: {managed_task_title(active_task, tasks.index(active_task))}"
@@ -678,7 +784,9 @@ class WorkflowRunner:
             task_states=states,
             active_task_id=active_id,
             completed_count=len(completed),
+            failed_count=len(failed),
             task_count=len(tasks),
+            total_seconds=total_seconds,
         )
 
         if active_task is None:
@@ -686,7 +794,9 @@ class WorkflowRunner:
                 "branch": branch,
                 "tasks": states,
                 "completed_count": len(completed),
+                "failed_count": len(failed),
                 "task_count": len(tasks),
+                "total_seconds": total_seconds,
             }
             return NodeResult(node.id, "success", text=message, data=data)
 
@@ -710,9 +820,26 @@ class WorkflowRunner:
             "attachments": attachments,
             "tasks": states,
             "completed_count": len(completed),
+            "failed_count": len(failed),
             "task_count": len(tasks),
+            "total_seconds": total_seconds,
         }
         return NodeResult(node.id, "success", text=prompt, data=data)
+
+    def _failed_task_titles(self) -> list[str]:
+        """Заголовки завдань, що вичерпали власний бюджет спроб."""
+        titles: list[str] = []
+        for node in self.workflow.nodes_of_kind("tasks_manager"):
+            progress = self.checkpoint.task_progress.get(node.id, {})
+            failed = {
+                str(task_id) for task_id in progress.get("failed_task_ids", [])
+            }
+            for index, task in enumerate(
+                normalize_managed_tasks(node.config.get("tasks"))
+            ):
+                if str(task["id"]) in failed:
+                    titles.append(managed_task_title(task, index))
+        return titles
 
     def _execute_result(
         self,
@@ -729,6 +856,13 @@ class WorkflowRunner:
             must_fix = []
         candidate_path = self._candidate_path_from(inputs)
         port = "true" if verdict else "false"
+
+        with self._control_lock:
+            manager = self.workflow.exhausted_target(node.id)
+        active_task_id = ""
+        if manager is not None:
+            progress = self.checkpoint.task_progress.get(manager.id, {})
+            active_task_id = str(progress.get("active_task_id", ""))
 
         user_note = ""
         forced = False
@@ -784,12 +918,46 @@ class WorkflowRunner:
                     forced = True
                 user_note = str(response.get("note", "")).strip()
 
+        failed_task_id = ""
+        if port == "false" and manager is not None and active_task_id and not forced:
+            attempt_key = f"{node.id}:{active_task_id}"
+            used_attempts = self.checkpoint.task_attempts.get(attempt_key, 0) + 1
+            self.checkpoint.task_attempts[attempt_key] = used_attempts
+            with self._control_lock:
+                attempt_limit = max(
+                    1, int(node.config.get("task_attempt_limit", 2))
+                )
+            if used_attempts >= attempt_limit:
+                port = "exhausted"
+                failed_task_id = active_task_id
+                progress = self.checkpoint.task_progress.setdefault(
+                    manager.id,
+                    {
+                        "active_task_id": "",
+                        "completed_task_ids": [],
+                        "failed_task_ids": [],
+                    },
+                )
+                failed_ids = progress.setdefault("failed_task_ids", [])
+                if active_task_id not in failed_ids:
+                    failed_ids.append(active_task_id)
+                self._emit(
+                    "task_exhausted",
+                    node=node,
+                    message=(
+                        f"Завдання вичерпало {attempt_limit} спроби — "
+                        "переходимо до наступного"
+                    ),
+                    task_id=active_task_id,
+                    attempts=used_attempts,
+                )
+
         key = f"{node.id}:{port}"
         used = self.checkpoint.port_counts.get(key, 0)
         with self._control_lock:
             configured_limit = self.workflow.result_port_limit(node, port)
         limit = configured_limit + self.checkpoint.limit_grants.get(key, 0)
-        if not forced and used + 1 > limit:
+        if port != "exhausted" and not forced and used + 1 > limit:
             raise InterventionRequired(
                 {
                     "node_id": node.id,
@@ -818,13 +986,12 @@ class WorkflowRunner:
             )
             save_path = str(node.config.get("save_path", "")).strip()
             if save_path:
-                target = Path(save_path).expanduser()
-                if not target.is_absolute():
-                    target = workspace / target
-                target = target.resolve()
+                target = local_output_path(save_path, workspace, ARTIFACTS_DIR)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(text, encoding="utf-8")
                 saved_to = str(target)
+        elif port == "exhausted":
+            text = reason or "Завдання вичерпало ліміт спроб"
         else:
             text = reason or "Результат відправлено на переробку"
 
@@ -851,7 +1018,209 @@ class WorkflowRunner:
         }
         if user_note:
             data["user_note"] = user_note
+        if failed_task_id:
+            data["task_outcome"] = "failed"
+            data["failed_task_id"] = failed_task_id
         return NodeResult(node.id, "success", text=text, data=data)
+
+    def _upstream_node_of_kind(
+        self, node_id: str, kind: str
+    ) -> FlowNode | None:
+        """Знайти найближчу ноду вказаного типу вгору по графу."""
+        seen: set[str] = set()
+        stack = [edge.source for edge in self.workflow.incoming(node_id)]
+        while stack:
+            current = stack.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            node = self.workflow.find(current)
+            if node is None:
+                continue
+            if node.kind == kind:
+                return node
+            stack.extend(edge.source for edge in self.workflow.incoming(current))
+        return None
+
+    def _execute_calibrator(
+        self,
+        node: FlowNode,
+        inputs: dict[str, Any],
+        context: dict[str, Any],
+        workspace: Path,
+        codex: CodexAdapter | None,
+    ) -> NodeResult:
+        """Після K-го відхилення зупинити Flow і зібрати рекомендації."""
+        manager = next(iter(self.workflow.nodes_of_kind("tasks_manager")), None)
+        task_id = ""
+        task_title = ""
+        if manager is not None:
+            progress = self.checkpoint.task_progress.get(manager.id, {})
+            task_id = str(progress.get("active_task_id", ""))
+            tasks = normalize_managed_tasks(manager.config.get("tasks"))
+            for index, task in enumerate(tasks):
+                if str(task["id"]) == task_id:
+                    task_title = managed_task_title(task, index)
+                    break
+
+        response = self.intervention_responses.pop(node.id, None)
+        if isinstance(response, dict):
+            action = str(response.get("action", "continue"))
+            if action == "retry_task":
+                self.checkpoint.calibration_attempts.pop(
+                    f"{node.id}:{task_id}", None
+                )
+                result_node = self._upstream_node_of_kind(node.id, "result")
+                if result_node is not None and task_id:
+                    self.checkpoint.task_attempts.pop(
+                        f"{result_node.id}:{task_id}", None
+                    )
+            return NodeResult(
+                node.id,
+                "success",
+                text="Калібрацію завершено",
+                data={"action": action, "task_id": task_id},
+            )
+
+        key = f"{node.id}:{task_id}"
+        attempt = self.checkpoint.calibration_attempts.get(key, 0) + 1
+        self.checkpoint.calibration_attempts[key] = attempt
+        with self._control_lock:
+            threshold = max(1, int(node.config.get("false_threshold", 1)))
+        if attempt < threshold:
+            self._emit(
+                "calibration_skipped",
+                node=node,
+                message=(
+                    f"Відхилення {attempt} з {threshold} — даємо Flow "
+                    "спробувати ще раз"
+                ),
+            )
+            return NodeResult(
+                node.id,
+                "success",
+                text=f"Відхилення {attempt} з {threshold}",
+                data={"action": "wait", "attempt": attempt},
+            )
+
+        review = self._review_payload_from(inputs)
+        reason = self._reason_from(inputs)
+        must_fix = review.get("must_fix")
+        if not isinstance(must_fix, list):
+            must_fix = []
+
+        reviewer = self._upstream_node_of_kind(node.id, "task_reviewer")
+        executor = self._upstream_node_of_kind(node.id, "executor")
+        if reviewer is not None:
+            node.config["thread_source"] = reviewer.id
+            node.config["reviewer_node"] = reviewer.id
+
+        used = skills_used(self.outputs_steps_for(executor))
+        catalogue = catalogue_text(list_skills(codex))
+        generated: list[str] = []
+        if executor is not None:
+            previous = self.checkpoint.outputs.get(executor.id, {})
+            data = previous.get("data")
+            if isinstance(data, dict):
+                generated = [
+                    str(path) for path in data.get("_generated_files", [])
+                ]
+
+        task_prompt = ""
+        if manager is not None and task_id:
+            for task in normalize_managed_tasks(manager.config.get("tasks")):
+                if str(task["id"]) == task_id:
+                    task_prompt = str(task.get("prompt", ""))
+                    break
+
+        analysis_context = dict(context)
+        analysis_context.update(
+            {
+                "skills_used": "\n".join(f"- {name}" for name in used)
+                or "Агент не відкрив жодного скіла",
+                "skills_catalogue": catalogue or "Каталог порожній",
+                "task_prompt": task_prompt,
+                "node_instructions": str(
+                    executor.config.get("instructions", "") if executor else ""
+                ),
+                "node_prompt": str(
+                    executor.config.get("prompt", "") if executor else ""
+                ),
+                "generated_files": "\n".join(
+                    f"- {path}" for path in generated
+                )
+                or "Файлів не зафіксовано",
+            }
+        )
+
+        self._emit(
+            "calibration_started",
+            node=node,
+            message="Аналізую скіли й готую рекомендації",
+        )
+        payload: Any = None
+        analysis_error = ""
+        try:
+            analysis = self._execute_agent(
+                node, inputs, analysis_context, workspace, codex
+            )
+            payload = analysis.data
+            if (
+                isinstance(payload, dict)
+                and "response" in payload
+                and not any(
+                    key in payload for key in ("summary", "points", "edits")
+                )
+            ):
+                payload = payload["response"]
+        except RunCancelled:
+            raise
+        except Exception as exc:
+            LOGGER.exception("Аналіз калібрації не вдався")
+            analysis_error = str(exc)
+
+        report = parse_report(
+            payload,
+            node_id=node.id,
+            node_title=node.title,
+            task_id=task_id,
+            task_title=task_title or "Активне завдання",
+            workflow_name=self.workflow.name,
+            attempt=attempt,
+            threshold=threshold,
+            reason=reason,
+            must_fix=[str(item) for item in must_fix],
+            skills_used=used,
+        )
+        if analysis_error:
+            report.analysis_error = analysis_error
+        if executor is not None:
+            for edit in report.edits:
+                if edit.target in {"node_prompt", "node_instructions"}:
+                    edit.node_id = edit.node_id or executor.id
+                if edit.target == "task_prompt":
+                    edit.task_id = edit.task_id or task_id
+
+        report_path = save_report(report, self._protocol_directory())
+        raise InterventionRequired(
+            {
+                "node_id": node.id,
+                "node_title": node.title,
+                "type": "calibration",
+                "question": (
+                    f"Рев'ювер відхилив «{report.task_title}» — "
+                    "перегляньте рекомендації"
+                ),
+                "report": report.to_dict(),
+                "report_path": str(report_path),
+            }
+        )
+
+    def outputs_steps_for(self, node: FlowNode | None) -> list[dict[str, Any]]:
+        """Кроки останнього ходу ноди, де видно відкриті скіли."""
+        if node is None:
+            return []
+        return list(self.checkpoint.protocol_steps.get(node.id, []))
 
     def _execute_agent(
         self,
@@ -904,8 +1273,11 @@ class WorkflowRunner:
         instructions = self._compose_agent_instructions(node, workspace)
 
         memory = str(node.config.get("memory", "thread"))
+        thread_source = str(node.config.get("thread_source", "")) or node.id
         resume_id = (
-            self.checkpoint.thread_ids.get(node.id, "") if memory == "thread" else ""
+            self.checkpoint.thread_ids.get(thread_source, "")
+            if memory == "thread"
+            else ""
         )
 
         self._stage(node, 3, "Підключення до моделі")
@@ -922,6 +1294,20 @@ class WorkflowRunner:
         )
 
         self._stage(node, 4, "Виконання агентом")
+
+        def report(activity: dict[str, Any]) -> None:
+            summary = str(activity.get("summary", "")).strip()
+            if not summary:
+                return
+            self._emit(
+                "agent_activity",
+                node=node,
+                message=summary,
+                kind=str(activity.get("kind", "")),
+                phase=str(activity.get("phase", "")),
+                paths=[str(item) for item in activity.get("paths", [])],
+            )
+
         run = codex.run_agent(
             prompt=prompt,
             developer_instructions=instructions,
@@ -931,12 +1317,22 @@ class WorkflowRunner:
             additional_workspaces=additional_workspaces,
             reasoning_effort=str(node.config.get("reasoning_effort", "medium")),
             attachments=attachments,
+            skills=[
+                {
+                    "name": str(item.get("name", "")),
+                    "path": str(item.get("path", "")),
+                }
+                for item in node.config.get("skills", [])
+                if isinstance(item, dict)
+            ],
             resume_thread_id=resume_id,
+            on_activity=report,
         )
         if self._stop.is_set():
             raise RunCancelled("Flow зупинено")
         self._stage(node, 5, "Обробка відповіді агента")
         self._last_steps = run.items
+        self.checkpoint.protocol_steps[node.id] = list(run.items)
         for step in run.items:
             kind = str(step.get("kind", "крок"))
             summary = str(step.get("summary", "")).strip()
@@ -947,7 +1343,7 @@ class WorkflowRunner:
                     message=f"{kind}: {summary}",
                 )
         self._last_resumed = bool(resume_id)
-        if run.thread_id and memory == "thread":
+        if run.thread_id and memory == "thread" and thread_source == node.id:
             self.checkpoint.thread_ids[node.id] = run.thread_id
 
         parsed = extract_json(run.text)
@@ -973,6 +1369,10 @@ class WorkflowRunner:
         if generated_files and isinstance(data, dict):
             data = dict(data)
             data["_generated_files"] = generated_files
+
+        if run.usage and isinstance(data, dict):
+            data = dict(data)
+            data["usage"] = {**run.usage, "context_window": run.context_window}
 
         if node.kind == "prompt_reviewer" and isinstance(data, dict):
             improved = data.get("improved_prompt")
@@ -1006,7 +1406,7 @@ class WorkflowRunner:
         required_raw = str(node.config.get("required_output_path", "")).strip()
         if not required_raw:
             return None
-        required = self._resolved_file(required_raw, workspace)
+        required = local_output_path(required_raw, workspace, ARTIFACTS_DIR)
         if not required.is_file():
             return None
         stat = required.stat()
@@ -1052,14 +1452,14 @@ class WorkflowRunner:
         if not required_raw:
             return enriched
 
-        required = self._resolved_file(required_raw, workspace)
+        required = local_output_path(required_raw, workspace, ARTIFACTS_DIR)
         if protected is not None and required == protected:
             raise WorkflowError("Вихідний артефакт не може перезаписувати оригінал")
         reported_raw = str(
             enriched.get("candidate_path") or enriched.get("output_path") or ""
         ).strip()
         if reported_raw:
-            reported = self._resolved_file(reported_raw, workspace)
+            reported = local_output_path(reported_raw, workspace, ARTIFACTS_DIR)
             if reported != required:
                 raise WorkflowError(
                     f"Нода «{node.title}» повідомила неправильний шлях артефакта: "
@@ -1279,12 +1679,36 @@ class WorkflowRunner:
         if not isinstance(inputs, dict):
             inputs = {}
         if node.config.get("prompt_source") == "input":
-            if "prompt" not in inputs:
+            incoming_prompt = inputs.get("prompt")
+            if incoming_prompt is None:
+                managed = next(
+                    (
+                        value
+                        for value in inputs.values()
+                        if isinstance(value, dict)
+                        and str(value.get("prompt", "")).strip()
+                    ),
+                    None,
+                )
+                if managed is not None:
+                    incoming_prompt = managed.get("prompt")
+            if incoming_prompt is None:
+                retry = next(
+                    (
+                        value.get("retry_context")
+                        for value in inputs.values()
+                        if isinstance(value, dict)
+                        and isinstance(value.get("retry_context"), dict)
+                    ),
+                    None,
+                )
+                if retry is not None:
+                    incoming_prompt = retry
+            if incoming_prompt is None:
                 raise WorkflowError(
                     f"Нода «{node.title}» очікує вхідну змінну «prompt». "
                     "Передайте text попередньої ноди у prompt."
                 )
-            incoming_prompt = inputs.get("prompt")
             prompt = (
                 incoming_prompt.strip()
                 if isinstance(incoming_prompt, str)
@@ -1327,14 +1751,17 @@ class WorkflowRunner:
         if visible_inputs:
             sections.append("# Вхідні дані\n" + stringify(visible_inputs))
         if workspace is not None:
-            folder_lines = [f"- Основна: {workspace}"]
+            folder_lines = [f"- Проєктна (єдина для запису): {workspace}"]
             folder_lines.extend(
-                f"- Додаткова: {path}" for path in additional_workspaces or []
+                f"- Джерело (лише читання): {path}"
+                for path in additional_workspaces or []
             )
             sections.append("# Доступні робочі папки\n" + "\n".join(folder_lines))
             required_raw = str(node.config.get("required_output_path", "")).strip()
             if required_raw:
-                required = self._resolved_file(required_raw, workspace)
+                required = local_output_path(
+                    required_raw, workspace, ARTIFACTS_DIR
+                )
                 sections.append(
                     "# Обов'язковий вихідний артефакт\n"
                     f"- Єдиний дозволений фінальний шлях: {required}\n"
@@ -1388,7 +1815,19 @@ class WorkflowRunner:
 
     @staticmethod
     def _compose_agent_instructions(node: FlowNode, workspace: Path) -> str:
-        sections: list[str] = []
+        sections: list[str] = [
+            (
+                "# Правило файлової архітектури Flow\n"
+                f"Тека цього Flow-проєкту: {workspace}. Усі нові файли, теки, "
+                "скрипти, тимчасові матеріали, звіти й фінальні артефакти створюй "
+                "лише всередині цієї теки. Додаткові робочі папки та абсолютні "
+                "шляхи поза нею є лише джерелами для читання: не змінюй їх і не "
+                "створюй там нічого. Якщо старий текст завдання вимагає зовнішній "
+                "output path, збережи еквівалент у підтеці artifacts цього проєкту "
+                "та поверни фактичний локальний шлях. Для службових скриптів "
+                "використовуй tools, для результатів — artifacts."
+            )
+        ]
         written = str(node.config.get("instructions", "")).strip()
         if written:
             sections.append(written)
@@ -1514,13 +1953,10 @@ class WorkflowRunner:
         self._stage(reviewer, 6, "Збереження звіту Work Reviewer")
         report_path = str(reviewer.config.get("report_path", "")).strip()
         target = (
-            Path(report_path).expanduser()
+            local_output_path(report_path, workspace, REPORTS_DIR)
             if report_path
             else protocol_path.with_name(REPORT_NAME)
         )
-        if not target.is_absolute():
-            target = workspace / target
-        target = target.resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(result.text, encoding="utf-8")
         self._emit(

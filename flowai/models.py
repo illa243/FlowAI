@@ -5,7 +5,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .calibration import CALIBRATION_SCHEMA
+
 FLOW_FORMAT_VERSION = 2
+DEFAULT_NODE_WIDTH = 220.0
+DEFAULT_NODE_HEIGHT = 130.0
 
 
 class UnsupportedFlowFormat(ValueError):
@@ -19,6 +23,7 @@ NODE_LABELS = {
     "executor": "Task Executor",
     "task_reviewer": "Task Reviewer",
     "result": "Result",
+    "calibrator": "Calibration Stop",
     "work_reviewer": "Work Reviewer",
 }
 
@@ -30,19 +35,32 @@ NODE_COLORS = {
     "executor": "#7C3AED",
     "task_reviewer": "#D97706",
     "result": "#16A34A",
+    "calibrator": "#E11D48",
     "work_reviewer": "#DB2777",
 }
 
 
 # Ноди, які запускають окремий потік Codex.
 AGENT_KINDS = frozenset(
-    {"prompt_reviewer", "executor", "task_reviewer", "work_reviewer"}
+    {
+        "prompt_reviewer",
+        "executor",
+        "task_reviewer",
+        "work_reviewer",
+        "calibrator",
+    }
 )
 
 # Ноди без портів: не беруть участі в маршруті.
 SIDECAR_KINDS = frozenset({"work_reviewer"})
 
-RESULT_PORTS = ("true", "false")
+# Ноди з входом, але без виходів: маршрут на них закінчується.
+TERMINAL_KINDS = frozenset({"calibrator"})
+
+# Ці ноди ніколи не стартують Flow самостійно.
+NEVER_SEEDED = frozenset({"calibrator"})
+
+RESULT_PORTS = ("true", "false", "exhausted")
 TASK_MANAGER_PORTS = ("next", "done")
 DEFAULT_PORT = "out"
 
@@ -74,6 +92,7 @@ def _agent_defaults(**overrides: Any) -> dict[str, Any]:
         "output_format": "text",
         "output_schema": {},
         "attachments": [],
+        "skills": [],
         "timeout_seconds": 1800,
         "retries": 0,
         "memory": "thread",
@@ -139,6 +158,9 @@ def _default_config(kind: str) -> dict[str, Any]:
             ),
             prompt=(
                 "# Промпт користувача\n{{entry_prompt}}\n\n"
+                "# Домовленості з користувачем (GrillMe)\n{{grill_summary}}\n"
+                "Це рішення користувача. Не переглядай і не викидай їх — "
+                "лише зроби промпт чіткішим навколо них.\n\n"
                 "# Ланцюг блоків, які працюватимуть далі\n{{flow_chain}}\n\n"
                 "Поверни покращений промпт і перелік того, що ти змінив."
             ),
@@ -175,6 +197,7 @@ def _default_config(kind: str) -> dict[str, Any]:
             "save_path": "",
             "true_limit": 1,
             "false_limit": 3,
+            "task_attempt_limit": 2,
             "wait_for_confirmation": False,
         },
         "work_reviewer": _agent_defaults(
@@ -193,6 +216,34 @@ def _default_config(kind: str) -> dict[str, Any]:
             monitored_nodes=[],
             report_path="",
         ),
+        "calibrator": _agent_defaults(
+            instructions=(
+                "Ти щойно відхилив роботу виконавця. Тепер поясни, чому "
+                "якість гірша за очікувану, і запропонуй конкретні правки. "
+                "Розділяй симптом і причину: пункт відхилення описує, що не "
+                "так у результаті, а edits міняють те, через що це сталося — "
+                "текст скіла або промпт. У before клади ТОЧНИЙ фрагмент, "
+                "який зараз є у файлі, інакше правку неможливо застосувати. "
+                "Не чіпай scripts/ і assets/ скілів."
+            ),
+            prompt=(
+                "# Скіли, які агент справді відкривав\n{{skills_used}}\n\n"
+                "# Каталог доступних скілів\n{{skills_catalogue}}\n\n"
+                "# Промпт завдання, яке провалилось\n{{task_prompt}}\n\n"
+                "# Постійні інструкції блоку-виконавця\n"
+                "{{node_instructions}}\n\n"
+                "# Промпт блоку-виконавця\n{{node_prompt}}\n\n"
+                "# Файли, які створив виконавець\n{{generated_files}}\n\n"
+                "Поверни JSON за схемою відповіді."
+            ),
+            sandbox="read-only",
+            output_format="json",
+            output_schema=dict(CALIBRATION_SCHEMA),
+            memory="thread",
+            false_threshold=1,
+            thread_source="",
+            reviewer_node="",
+        ),
     }
     if kind not in defaults:
         raise UnsupportedFlowFormat(f"Невідомий тип ноди: {kind}")
@@ -207,6 +258,8 @@ class FlowNode:
     x: float = 0.0
     y: float = 0.0
     config: dict[str, Any] = field(default_factory=dict)
+    width: float = DEFAULT_NODE_WIDTH
+    height: float = DEFAULT_NODE_HEIGHT
 
     @property
     def short_id(self) -> str:
@@ -247,6 +300,8 @@ class FlowNode:
             title=str(raw.get("title") or NODE_LABELS[kind]),
             x=float(raw.get("x", 0.0)),
             y=float(raw.get("y", 0.0)),
+            width=float(raw.get("width", DEFAULT_NODE_WIDTH)),
+            height=float(raw.get("height", DEFAULT_NODE_HEIGHT)),
             config=config,
         )
 
@@ -305,6 +360,7 @@ class Workflow:
     edges: list[FlowEdge] = field(default_factory=list)
     workspace: str = ""
     additional_folders: list[str] = field(default_factory=list)
+    grill_summary: str = ""
     format_version: int = FLOW_FORMAT_VERSION
 
     def node(self, node_id: str) -> FlowNode:
@@ -349,6 +405,8 @@ class Workflow:
             return ()
         if node.kind in SIDECAR_KINDS:
             return ()
+        if node.kind in TERMINAL_KINDS:
+            return ()
         if node.kind == "result":
             return RESULT_PORTS
         if node.kind == "tasks_manager":
@@ -356,6 +414,8 @@ class Workflow:
         return (DEFAULT_PORT,)
 
     def result_port_limit(self, node: FlowNode, port: str) -> int:
+        if node.kind == "result" and port == "exhausted":
+            return 10**6
         configured = max(1, int(node.config.get(f"{port}_limit", 1)))
         if node.kind != "result" or port != "true":
             return configured
@@ -369,6 +429,22 @@ class Workflow:
                 len(normalize_managed_tasks(target.config.get("tasks"))),
             )
         return max(configured, managed_count)
+
+    def exhausted_target(self, node_id: str) -> FlowNode | None:
+        """Tasks Manager, у який веде жовтий вихід Result, якщо він з'єднаний."""
+        for edge in self.outgoing(node_id, "exhausted"):
+            target = self.find(edge.target)
+            if target is not None and target.kind == "tasks_manager":
+                return target
+        return None
+
+    def calibrator_for(self, node_id: str) -> FlowNode | None:
+        """Нода калібрації, підвішена на вихід FALSE вказаного Result."""
+        for edge in self.outgoing(node_id, "false"):
+            target = self.find(edge.target)
+            if target is not None and target.kind == "calibrator":
+                return target
+        return None
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -400,6 +476,43 @@ class Workflow:
                 errors.append(
                     f"Блок «{target.title}» не має входів "
                     "і не може брати участі в маршруті"
+                )
+
+        for edge in self.edges:
+            if edge.source_port != "exhausted":
+                continue
+            target = self.find(edge.target)
+            if target is None or target.kind != "tasks_manager":
+                errors.append(
+                    "Вихід EXHAUSTED можна з'єднати лише з блоком Tasks Manager"
+                )
+
+        for edge in self.edges:
+            target = self.find(edge.target)
+            if target is None or target.kind != "calibrator":
+                continue
+            source = self.find(edge.source)
+            if (
+                source is None
+                or source.kind != "result"
+                or edge.source_port != "false"
+            ):
+                errors.append(
+                    f"Блок «{target.title}» (Calibration Stop) можна з'єднати "
+                    "лише з виходом FALSE блока Result"
+                )
+
+        for node in self.nodes_of_kind("result"):
+            attached = [
+                edge.target
+                for edge in self.outgoing(node.id, "false")
+                if (found := self.find(edge.target)) is not None
+                and found.kind == "calibrator"
+            ]
+            if len(attached) > 1:
+                errors.append(
+                    f"До блока «{node.title}» можна підключити "
+                    "лише один Calibration Stop"
                 )
 
         if len(self.nodes_of_kind("work_reviewer")) > 1:
@@ -535,6 +648,7 @@ class Workflow:
             "name": self.name,
             "workspace": self.workspace,
             "additional_folders": list(self.additional_folders),
+            "grill_summary": self.grill_summary,
             "nodes": [asdict(node) for node in self.nodes],
             "edges": [asdict(edge) for edge in self.edges],
         }
@@ -558,16 +672,17 @@ class Workflow:
             additional_folders=[
                 str(item) for item in raw.get("additional_folders", []) if str(item)
             ],
+            grill_summary=str(raw.get("grill_summary") or ""),
             format_version=version,
             nodes=[FlowNode.from_dict(item) for item in raw.get("nodes", [])],
             edges=[FlowEdge.from_dict(item) for item in raw.get("edges", [])],
         )
 
     def resolved_workspace(self, project_path: Path | None = None) -> Path:
-        if self.workspace.strip():
-            return Path(self.workspace).expanduser().resolve()
         if project_path:
             return project_path.resolve().parent
+        if self.workspace.strip():
+            return Path(self.workspace).expanduser().resolve()
         return Path.cwd().resolve()
 
     def resolved_additional_folders(
@@ -575,7 +690,13 @@ class Workflow:
     ) -> list[Path]:
         workspace = self.resolved_workspace(project_path)
         resolved: list[Path] = []
-        for raw_path in self.additional_folders:
+        raw_paths = list(self.additional_folders)
+        # Since format v2 ``workspace`` may point at a legacy source directory.
+        # For a saved Flow its own folder is always the write root, while this
+        # legacy location remains available only as an additional source.
+        if project_path is not None and self.workspace.strip():
+            raw_paths.insert(0, self.workspace)
+        for raw_path in raw_paths:
             path = Path(raw_path).expanduser()
             if not path.is_absolute():
                 path = workspace / path

@@ -7,7 +7,6 @@ from PySide6.QtCore import QPoint, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
-    QDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -18,6 +17,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .motion import AnimatedDialog
+
 IMAGE_SUFFIXES = frozenset(
     {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 )
@@ -25,13 +26,13 @@ PATH_ROLE = Qt.ItemDataRole.UserRole
 IMAGE_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
-class ImagePreviewDialog(QDialog):
+class ImagePreviewDialog(AnimatedDialog):
     def __init__(self, path: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("imagePreview")
         self.path = path
         self.original = QPixmap(str(path))
         self.setWindowTitle(path.name)
-        self.setStyleSheet("background: #080B12; color: white;")
 
         title = QLabel(path.name)
         title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -44,6 +45,7 @@ class ImagePreviewDialog(QDialog):
         header.addWidget(close)
 
         self.image = QLabel()
+        self.image.setObjectName("imagePreviewCanvas")
         self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image.setMinimumSize(200, 160)
 

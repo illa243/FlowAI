@@ -5,6 +5,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import (
@@ -23,19 +25,25 @@ from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QSizeP
 
 from flowai import codex_adapter
 from flowai.models import NODE_COLORS, FlowEdge, FlowNode, Workflow
+from flowai.persistence import load_workflow, save_workflow
+from flowai.ui import main_window as main_window_module
 from flowai.ui.canvas import FlowScene, FlowView
 from flowai.ui.inspector import (
     ExpandablePlainTextEdit,
     FullScreenTextEditorDialog,
     Inspector,
+    ManagedTasksWidget,
 )
 from flowai.ui.main_window import (
     GeneratedFilesDialog,
     MainWindow,
     ResultConfirmationDialog,
     ResultLimitDialog,
+    RunWorker,
     WorkflowSettingsDialog,
 )
+from flowai.ui.results_dialog import ResultsDialog
+from flowai.ui.stats_dialog import StatsDialog
 from flowai.ui.workspace_sidebar import (
     ResponsiveListWidget,
     WorkspaceCard,
@@ -104,6 +112,15 @@ class PortMouseEventStub:
         self.accepted = True
 
 
+class NodeMouseEventStub(PortMouseEventStub):
+    def __init__(self, local_position: QPointF, scene_position: QPointF) -> None:
+        super().__init__(scene_position)
+        self._local_position = local_position
+
+    def pos(self) -> QPointF:
+        return self._local_position
+
+
 def test_right_mouse_drag_pans_canvas() -> None:
     app = application()
     scene = FlowScene()
@@ -164,6 +181,221 @@ def test_f2_requests_rename_for_selected_node_and_workspace() -> None:
     sidebar.spinner_timer.stop()
 
 
+def test_workspace_sidebar_reuses_cards_for_state_updates() -> None:
+    application()
+    session = WorkspaceSession("Проєкт")
+    sidebar = WorkspaceSidebar()
+    sidebar.set_sessions([session], session.id)
+    card = sidebar._cards[session.id]
+
+    session.run_state = "running"
+    sidebar.set_sessions([session], session.id)
+
+    assert sidebar._cards[session.id] is card
+    assert card.status_text.text() == "Виконується"
+    sidebar.spinner_timer.stop()
+    sidebar.deleteLater()
+
+
+def test_reentrant_sidebar_refresh_is_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application()
+    session = WorkspaceSession("Проєкт")
+    sidebar = WorkspaceSidebar()
+    original_sync = sidebar._sync_sessions
+    sync_calls: list[bool] = []
+
+    def reentrant_sync(
+        sessions: list[WorkspaceSession], selected_id: str | None
+    ) -> None:
+        sync_calls.append(True)
+        if len(sync_calls) == 1:
+            sidebar.set_sessions(sessions, selected_id)
+        original_sync(sessions, selected_id)
+
+    monkeypatch.setattr(sidebar, "_sync_sessions", reentrant_sync)
+    sidebar.set_sessions([session], session.id)
+
+    assert sync_calls == [True]
+    QApplication.processEvents()
+    assert sync_calls == [True, True]
+    sidebar.spinner_timer.stop()
+    sidebar.deleteLater()
+
+
+def test_run_worker_throttles_activity_bursts_but_keeps_completion() -> None:
+    application()
+    worker = RunWorker("session", Workflow(name="Тест"), None)
+    messages: list[tuple[str, str, object]] = []
+    worker.message.connect(
+        lambda session_id, message_type, payload: messages.append(
+            (session_id, message_type, payload)
+        )
+    )
+
+    for index in range(100):
+        worker._forward_event(
+            {
+                "type": "agent_activity",
+                "node_id": "node",
+                "message": f"step {index}",
+            }
+        )
+    worker._forward_event(
+        {
+            "type": "agent_activity",
+            "node_id": "node",
+            "phase": "completed",
+            "message": "done",
+        }
+    )
+
+    assert len(messages) == 2
+    assert messages[-1][2]["phase"] == "completed"
+
+
+def test_agent_activity_does_not_rebuild_workspace_chrome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    sidebar_refreshes: list[bool] = []
+    action_refreshes: list[bool] = []
+    monkeypatch.setattr(
+        window, "_refresh_workspace_sidebar", lambda: sidebar_refreshes.append(True)
+    )
+    monkeypatch.setattr(
+        window, "_update_workspace_actions", lambda: action_refreshes.append(True)
+    )
+
+    for index in range(100):
+        window._handle_run_event(
+            session.id,
+            {
+                "type": "agent_activity",
+                "node_id": "node",
+                "message": f"step {index}",
+            },
+        )
+
+    assert sidebar_refreshes == []
+    assert action_refreshes == []
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_inspector_shows_pinned_skills_for_an_agent_node() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    node = FlowNode.create("executor")
+    node.config["skills"] = [{"name": "birds-map", "path": "C:/s/birds-map"}]
+    window.inspector.set_workflow(Workflow(nodes=[node]))
+    window.inspector.set_object(node)
+    assert window.inspector.skill_pins.skills() == [
+        {"name": "birds-map", "path": "C:/s/birds-map"}
+    ]
+    window.close()
+
+
+def test_inspector_saves_a_newly_pinned_skill() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    node = FlowNode.create("executor")
+    window.inspector.set_workflow(Workflow(nodes=[node]))
+    window.inspector.set_object(node)
+    window.inspector.skill_pins.add_skill("image-cutout", "C:/s/image-cutout")
+    assert node.config["skills"] == [
+        {"name": "image-cutout", "path": "C:/s/image-cutout"}
+    ]
+    window.close()
+
+
+def test_inspector_does_not_pin_the_same_skill_twice() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    node = FlowNode.create("executor")
+    window.inspector.set_workflow(Workflow(nodes=[node]))
+    window.inspector.set_object(node)
+    window.inspector.skill_pins.add_skill("image-cutout", "C:/s/image-cutout")
+    window.inspector.skill_pins.add_skill("image-cutout", "C:/s/image-cutout")
+    assert len(node.config["skills"]) == 1
+    window.close()
+
+
+def test_result_node_has_no_skill_field() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    node = FlowNode.create("result")
+    window.inspector.set_workflow(Workflow(nodes=[node]))
+    window.inspector.set_object(node)
+    assert window.inspector.skill_pins.isVisible() is False
+    window.close()
+
+
+def test_calibrator_node_has_no_output_ports() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    workflow = Workflow()
+    node = FlowNode.create("calibrator")
+    workflow.nodes.append(node)
+    window.scene.set_workflow(workflow)
+    item = window.scene.node_items[node.id]
+    assert item.output_ports == {}
+    assert item.input_port is not None
+    window.close()
+
+
+def test_inspector_shows_the_calibration_threshold() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    node = FlowNode.create("calibrator")
+    node.config["false_threshold"] = 3
+    window.inspector.set_workflow(Workflow(nodes=[node]))
+    window.inspector.set_object(node)
+    assert window.inspector.false_threshold.value() == 3
+    window.inspector.false_threshold.setValue(2)
+    assert node.config["false_threshold"] == 2
+    window.close()
+
+
+def test_inspector_warns_when_exhausted_becomes_unreachable() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    workflow = Workflow()
+    result = FlowNode.create("result")
+    result.config["task_attempt_limit"] = 3
+    stop = FlowNode.create("calibrator")
+    stop.config["false_threshold"] = 1
+    workflow.nodes.extend([result, stop])
+    workflow.edges.append(FlowEdge.create(result.id, stop.id, "false"))
+    window.inspector.set_workflow(workflow)
+    window.inspector.set_object(stop)
+    assert "EXHAUSTED" in window.inspector.threshold_hint.text()
+    assert window.inspector.threshold_hint.isVisible() is True
+    window.close()
+
+
+def test_inspector_hides_the_warning_when_exhausted_can_fire() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    workflow = Workflow()
+    result = FlowNode.create("result")
+    result.config["task_attempt_limit"] = 2
+    stop = FlowNode.create("calibrator")
+    stop.config["false_threshold"] = 5
+    workflow.nodes.extend([result, stop])
+    workflow.edges.append(FlowEdge.create(result.id, stop.id, "false"))
+    window.inspector.set_workflow(workflow)
+    window.inspector.set_object(stop)
+    assert window.inspector.threshold_hint.isVisible() is False
+    window.close()
+
+
 def test_responsive_lists_follow_available_aspect_ratio() -> None:
     app = application()
     responsive = ResponsiveListWidget()
@@ -198,8 +430,11 @@ def test_dock_layers_are_compact_and_keep_only_controls() -> None:
     assert "Додати ноду" not in visible_texts
     assert "Властивості" not in visible_texts
     assert "З'єднання" not in visible_texts
-    assert len(window.node_buttons) == 7
+    assert len(window.node_buttons) == 8
     assert any("Tasks Manager" in button.text() for button in window.node_buttons)
+    assert {button.button_color for button in window.node_buttons} == set(
+        NODE_COLORS.values()
+    )
     window.close()
 
 
@@ -217,26 +452,88 @@ def test_main_toolbar_contains_settings_run_stop_files_and_account() -> None:
     assert window.new_action not in toolbar_actions
     assert window.open_action not in toolbar_actions
     assert window.save_action not in toolbar_actions
-    assert window.settings_action in toolbar_actions
-    assert window.run_action in toolbar_actions
-    assert window.stop_action in toolbar_actions
-    assert window.files_action in toolbar_actions
+    assert window.settings_action not in toolbar_actions
+    assert window.edit_flow_action not in toolbar_actions
+    assert window.run_action not in toolbar_actions
+    assert window.stop_action not in toolbar_actions
+    assert window.files_action not in toolbar_actions
     assert window.settings_action.text() == "Settings"
     assert window.settings_action.icon().isNull() is False
     assert window.run_action.text() == "▶ Run"
     assert window.stop_action.text() == "■ Stop"
     assert window.files_action.text() == "Files"
-    assert (
-        toolbar_actions.index(window.stop_action)
-        == toolbar_actions.index(window.run_action) + 1
-    )
-    assert (
-        toolbar_actions.index(window.files_action)
-        == toolbar_actions.index(window.stop_action) + 1
-    )
+    assert window.settings_button.defaultAction() is window.settings_action
+    assert window.settings_button.text() == "Settings"
+    assert window.settings_button.minimumWidth() >= 90
+    assert window.edit_flow_button.defaultAction() is window.edit_flow_action
+    assert window.edit_flow_button.text() == "Edit Flow"
+    assert window.edit_flow_button.objectName() == "editFlowButton"
+    assert window.edit_flow_action.icon().isNull() is False
+    assert window.run_button.defaultAction() is window.run_action
+    assert window.stop_button.defaultAction() is window.stop_action
+    assert window.files_button.defaultAction() is window.files_action
     assert window.run_button.objectName() == "runButton"
     assert window.stop_button.objectName() == "stopButton"
     assert window.files_button.objectName() == "filesButton"
+    window.close()
+
+
+def test_ai_edited_flow_replaces_selected_flow_and_keeps_undo_state() -> None:
+    application()
+    window = MainWindow(
+        check_account_on_start=False, restore_workspaces=False, restore_layout=False
+    )
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None and session.workflow is not None
+    original = session.workflow.to_dict()
+    edited = Workflow.from_dict(original)
+    edited.name = "AI edited"
+
+    window._apply_ai_edited_workflow(session, edited)
+
+    assert window.scene.workflow.name == "AI edited"
+    assert session.saved_history_state == edited.to_dict()
+    assert session.dirty is False
+    assert session.undo_history[-1] == original
+    assert window.edit_flow_action.isEnabled() is True
+    window.close()
+
+
+def test_edit_flow_ai_passes_the_selected_flow_path_and_reloads_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application()
+    window = MainWindow(
+        check_account_on_start=False, restore_workspaces=False, restore_layout=False
+    )
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None and session.workflow is not None
+    target = save_workflow(session.workflow, tmp_path / "selected.flowai.json")
+    session.project_path = target
+    window.project_path = target
+    opened: list[Path] = []
+
+    class EditDialogStub:
+        def __init__(self, _parent, *, edit_path: Path, initial_workspace: Path):
+            opened.append(edit_path)
+            assert initial_workspace == tmp_path.resolve()
+            self.saved_path = str(edit_path)
+
+        def exec(self):
+            edited = load_workflow(target)
+            edited.name = "Changed by selected AI edit"
+            save_workflow(edited, target)
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module, "FlowComposerDialog", EditDialogStub)
+    monkeypatch.setattr(window, "save_workflow", lambda: True)
+
+    window.edit_flow_with_ai()
+
+    assert opened == [target.resolve()]
+    assert window.scene.workflow.name == "Changed by selected AI edit"
     window.close()
 
 
@@ -293,10 +590,12 @@ def test_live_result_limits_are_forwarded_to_the_running_worker() -> None:
     window.inspector.set_object(result)
     window._update_workspace_actions()
     window.inspector.false_limit.setValue(8)
+    window.inspector.wait_for_confirmation.setChecked(True)
 
     assert worker.updates
     assert worker.updates[-1][0] == result.id
     assert worker.updates[-1][1]["false_limit"] == 8
+    assert worker.updates[-1][1]["wait_for_confirmation"] is True
     session.run_worker = None
     session.run_thread = None
     session.run_state = "idle"
@@ -532,17 +831,18 @@ def test_workspace_card_separates_selection_and_run_status() -> None:
     application()
     session = WorkspaceSession("Фоновий Flow")
     unloaded = WorkspaceCard(session, selected=False)
-    assert "#64748B" in unloaded.styleSheet()
+    assert unloaded.rail.property("state") == "idle"
 
     session.workflow = Workflow(name="Фоновий Flow")
     session.load_state = "loaded"
     session.run_state = "running"
     background = WorkspaceCard(session, selected=False)
-    assert "#F59E0B" in background.styleSheet()
+    assert background.rail.property("state") == "loaded"
     assert background.status_icon.text() in {"◐", "◓", "◑", "◒"}
 
     selected = WorkspaceCard(session, selected=True)
-    assert "#22C55E" in selected.styleSheet()
+    assert selected.property("selected") is True
+    assert selected.rail.property("state") == "selected"
     assert selected.status_icon.toolTip() == "Виконується"
 
 
@@ -566,7 +866,7 @@ def test_switching_workspaces_preserves_each_flow_state() -> None:
 
     assert window.current_workspace is first
     assert window.scene.workflow.name == "Перший"
-    assert "Журнал першого" in window.log_view.toPlainText()
+    assert "Журнал першого" in window.log_panel.view.toPlainText()
     assert window.workspace_sidebar.list_widget.count() == 2
 
     window._set_workspace_name(first, "Перейменований проєкт")
@@ -608,8 +908,14 @@ def test_background_flow_sets_unread_result(
     assert first.unread_result is True
     assert window.current_workspace is second
 
+    shown: list[str] = []
+    monkeypatch.setattr(
+        MainWindow, "show_run_results", lambda self: shown.append("shown")
+    )
     window.select_workspace(first.id)
+    QApplication.processEvents()
     assert first.unread_result is False
+    assert shown == ["shown"]
     for session in window.workspace_sessions:
         session.dirty = False
     window.dirty = False
@@ -662,7 +968,7 @@ def test_agent_prompt_event_keeps_large_text_out_of_the_ui_log() -> None:
         },
     )
 
-    visible = window.log_view.toPlainText()
+    visible = window.log_panel.view.toPlainText()
     assert "промпт сформовано; вкладень: 2" in visible
     assert "secret-instructions" not in visible
     assert "large-prompt" not in visible
@@ -671,7 +977,7 @@ def test_agent_prompt_event_keeps_large_text_out_of_the_ui_log() -> None:
     window.close()
 
 
-def test_result_node_exposes_true_and_false_ports() -> None:
+def test_result_node_exposes_true_false_and_exhausted_ports() -> None:
     application()
     result = FlowNode.create("result")
     watcher = FlowNode.create("work_reviewer")
@@ -679,9 +985,10 @@ def test_result_node_exposes_true_and_false_ports() -> None:
     scene.set_workflow(Workflow(nodes=[result, watcher]))
 
     item = scene.node_items[result.id]
-    assert set(item.output_ports) == {"true", "false"}
+    assert set(item.output_ports) == {"true", "false", "exhausted"}
     assert item.output_ports["true"].label.startswith("TRUE")
     assert item.output_ports["false"].label.startswith("FALSE")
+    assert item.output_ports["exhausted"].label.startswith("EXHAUSTED")
 
     # Блок-спостерігач не бере участі в маршруті.
     sidecar = scene.node_items[watcher.id]
@@ -732,6 +1039,330 @@ def test_double_click_adds_a_persistent_draggable_edge_control_point() -> None:
     scene.delete_selection()
     assert edge.control_points == []
     assert edge.id in scene.edge_items
+
+
+def test_node_can_be_resized_in_both_axes_and_dimensions_are_persisted() -> None:
+    application()
+    source = FlowNode.create("executor", 0, 0)
+    target = FlowNode.create("executor", 520, 0)
+    edge = FlowEdge.create(source.id, target.id)
+    workflow = Workflow(nodes=[source, target], edges=[edge])
+    scene = FlowScene()
+    scene.set_workflow(workflow)
+    item = scene.node_items[source.id]
+    changes: list[bool] = []
+    scene.model_changed.connect(lambda: changes.append(True))
+
+    assert item._resize_mode_at(QPointF(220, 60)) == "width"
+    assert item._resize_mode_at(QPointF(100, 130)) == "height"
+    press = NodeMouseEventStub(QPointF(220, 130), QPointF(220, 130))
+    move = NodeMouseEventStub(QPointF(360, 240), QPointF(360, 240))
+    release = NodeMouseEventStub(QPointF(360, 240), QPointF(360, 240))
+    item.mousePressEvent(press)
+    item.mouseMoveEvent(move)
+    item.mouseReleaseEvent(release)
+
+    assert press.accepted is True
+    assert move.accepted is True
+    assert release.accepted is True
+    assert item.boundingRect().size().width() == 360
+    assert item.boundingRect().size().height() == 240
+    assert source.width == 360
+    assert source.height == 240
+    assert changes == [True]
+    output = item.output_port_item("out")
+    assert output is not None
+    assert output.pos() == QPointF(360, 120)
+    assert scene.edge_items[edge.id].path().pointAtPercent(0) == output.scenePos()
+
+    restored = Workflow.from_dict(workflow.to_dict())
+    restored_source = restored.node(source.id)
+    assert restored_source.width == 360
+    assert restored_source.height == 240
+
+
+def test_node_selection_and_move_updates_flush_after_interaction() -> None:
+    application()
+    node = FlowNode.create("tasks_manager", 0, 0)
+    scene = FlowScene()
+    scene.set_workflow(Workflow(nodes=[node]))
+    item = scene.node_items[node.id]
+    selections: list[object] = []
+    changes: list[bool] = []
+    scene.selection_object_changed.connect(selections.append)
+    scene.model_changed.connect(lambda: changes.append(True))
+
+    scene.begin_node_interaction(item)
+    item.setSelected(True)
+    item.setPos(10, 10)
+    item.setPos(20, 20)
+
+    assert selections == []
+    assert changes == []
+    scene.end_node_interaction(item)
+    assert selections == [node]
+    assert changes == [True]
+    assert (node.x, node.y) == (20.0, 20.0)
+
+
+def test_dragging_multi_selection_flushes_once_after_interaction() -> None:
+    """Qt рухає всі вибрані ноди, але зміна моделі має бути однією на жест.
+
+    Інакше кожна невибрана під курсором нода емітить model_changed на кожну
+    подію руху миші, а це тягне за собою перебудову сайдбару й заголовка.
+    """
+    application()
+    dragged = FlowNode.create("executor", 0, 0)
+    companion = FlowNode.create("task_reviewer", 400, 0)
+    scene = FlowScene()
+    scene.set_workflow(Workflow(nodes=[dragged, companion]))
+    dragged_item = scene.node_items[dragged.id]
+    companion_item = scene.node_items[companion.id]
+    changes: list[bool] = []
+    scene.model_changed.connect(lambda: changes.append(True))
+
+    dragged_item.setSelected(True)
+    companion_item.setSelected(True)
+    scene.begin_node_interaction(dragged_item)
+    for step in range(1, 11):
+        offset = step * 5
+        dragged_item.setPos(offset, offset)
+        companion_item.setPos(400 + offset, offset)
+
+    assert changes == [], "Під час жесту модель не має емітити зміни"
+    scene.end_node_interaction(dragged_item)
+    assert changes == [True]
+    assert (dragged.x, dragged.y) == (50.0, 50.0)
+    assert (companion.x, companion.y) == (450.0, 50.0)
+
+
+def test_drag_disables_node_shadow_and_restores_it() -> None:
+    """Тінь — розмиття на кожен кадр, тож на час перетягування вона вимикається."""
+    application()
+    dragged = FlowNode.create("executor", 0, 0)
+    idle = FlowNode.create("task_reviewer", 400, 0)
+    scene = FlowScene()
+    scene.set_workflow(Workflow(nodes=[dragged, idle]))
+    dragged_item = scene.node_items[dragged.id]
+    idle_item = scene.node_items[idle.id]
+    assert dragged_item.graphicsEffect().isEnabled() is True
+
+    scene.begin_node_interaction(dragged_item)
+    assert dragged_item.graphicsEffect().isEnabled() is False
+    assert idle_item.graphicsEffect().isEnabled() is True
+
+    scene.end_node_interaction(dragged_item)
+    assert dragged_item.graphicsEffect().isEnabled() is True
+
+
+def test_drag_disables_shadows_of_the_whole_selection() -> None:
+    application()
+    dragged = FlowNode.create("executor", 0, 0)
+    companion = FlowNode.create("task_reviewer", 400, 0)
+    scene = FlowScene()
+    scene.set_workflow(Workflow(nodes=[dragged, companion]))
+    dragged_item = scene.node_items[dragged.id]
+    companion_item = scene.node_items[companion.id]
+    dragged_item.setSelected(True)
+    companion_item.setSelected(True)
+
+    scene.begin_node_interaction(dragged_item)
+    assert companion_item.graphicsEffect().isEnabled() is False
+    scene.end_node_interaction(dragged_item)
+    assert companion_item.graphicsEffect().isEnabled() is True
+
+
+def test_task_editors_are_reused_instead_of_rebuilt() -> None:
+    """Перестворення редакторів завдань блокувало UI-потік на десятки мс."""
+    application()
+    widget = ManagedTasksWidget()
+    widget.set_tasks(
+        [
+            {"id": "t1", "prompt": "Перше", "attachments": []},
+            {"id": "t2", "prompt": "Друге", "attachments": []},
+        ]
+    )
+    first, second = widget.sections
+
+    widget.set_tasks(
+        [
+            {"id": "t1", "prompt": "Оновлене", "attachments": []},
+            {"id": "t2", "prompt": "Друге", "attachments": []},
+        ]
+    )
+    assert widget.sections[0] is first
+    assert widget.sections[1] is second
+    assert widget.sections[0].prompt.toPlainText() == "Оновлене"
+    assert [item["id"] for item in widget.tasks()] == ["t1", "t2"]
+
+    widget.set_tasks([{"id": "t1", "prompt": "Одне", "attachments": []}])
+    assert widget.sections == [first]
+
+    widget.set_tasks(
+        [
+            {"id": "t1", "prompt": "Одне", "attachments": []},
+            {"id": "t3", "prompt": "Третє", "attachments": []},
+        ]
+    )
+    assert widget.sections[0] is first
+    assert len(widget.sections) == 2
+    assert widget.tasks()[1]["id"] == "t3"
+    widget.deleteLater()
+
+
+def test_reselecting_tasks_manager_keeps_its_editors() -> None:
+    application()
+    node = FlowNode.create("tasks_manager")
+    node.config["tasks"] = [
+        {"id": f"t{index}", "prompt": f"Завдання {index}", "attachments": []}
+        for index in range(8)
+    ]
+    inspector = Inspector()
+    inspector.set_workflow(Workflow(nodes=[node]))
+    inspector.set_object(node)
+    editors = list(inspector.tasks_editor.sections)
+    assert len(editors) == 8
+
+    inspector.set_object(node)
+    assert inspector.tasks_editor.sections == editors
+    inspector.deleteLater()
+
+
+def test_generated_files_dialog_is_dark_and_not_striped() -> None:
+    application()
+    session = WorkspaceSession(display_name="Тест")
+    session.generated_file_groups = [
+        {
+            "node_id": "abc123",
+            "node_title": "Task Executor",
+            "iteration": 1,
+            "color": "#7C3AED",
+            "intermediate": [],
+            "result": [],
+        }
+    ]
+    dialog = GeneratedFilesDialog(session)
+    assert dialog.tree.alternatingRowColors() is False
+    heading = dialog.tree.topLevelItem(0)
+    assert heading.foreground(0).color().name() == "#7c3aed"
+    child = heading.child(0).child(0)
+    assert child.foreground(0).color().name() == "#e5e7eb"
+    dialog.deleteLater()
+
+
+def test_tasks_node_keeps_seconds_in_states() -> None:
+    application()
+    scene = FlowScene()
+    workflow = Workflow(name="Черга")
+    manager = FlowNode.create("tasks_manager")
+    manager.config["tasks"] = [
+        {"id": "t1", "prompt": "Перше", "attachments": []}
+    ]
+    workflow.nodes = [manager]
+    scene.set_workflow(workflow)
+    scene.set_task_states(
+        manager.id,
+        [{"id": "t1", "title": "Перше", "status": "completed", "seconds": 12.5}],
+    )
+    item = scene.node_items[manager.id]
+    assert item.task_states[0]["seconds"] == 12.5
+
+
+def test_result_node_has_three_ports_and_attempt_field() -> None:
+    application()
+    scene = FlowScene()
+    workflow = Workflow(name="Тест")
+    result = FlowNode.create("result")
+    workflow.nodes = [result]
+    scene.set_workflow(workflow)
+    item = scene.node_items[result.id]
+    assert set(item.output_ports) == {"true", "false", "exhausted"}
+
+    inspector = Inspector()
+    inspector.set_workflow(workflow)
+    inspector.set_object(result)
+    assert inspector.task_attempt_limit.value() == 2
+
+
+def test_run_with_failed_tasks_reports_partial_success() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    session.task_states = {
+        "n1": [
+            {"id": "t1", "title": "Перше", "status": "completed", "seconds": 1.0},
+            {"id": "t2", "title": "Друге", "status": "failed", "seconds": 2.0},
+        ]
+    }
+    window._run_completed(session.id, None)
+    assert session.run_state == "completed_with_failures"
+    session.dirty = False
+    assert session.status_text == "Виконано з провалами"
+    window.dirty = False
+    window.close()
+
+
+def test_stats_dialog_lists_nodes_with_time_and_tokens() -> None:
+    application()
+    session = WorkspaceSession(display_name="Тест")
+    session.run_events = [
+        {
+            "type": "node_finished",
+            "node_id": "n1",
+            "node_title": "Task Executor",
+            "result": {
+                "duration_seconds": 4.0,
+                "data": {"usage": {"total_tokens": 200, "context_window": 1000}},
+            },
+        }
+    ]
+    dialog = StatsDialog(session)
+    heading = dialog.tree.topLevelItem(0)
+    assert heading.text(0).startswith("Task Executor")
+    assert heading.text(1) == "1"
+    assert "4.0" in heading.text(2)
+    assert "200" in heading.text(4)
+    dialog.deleteLater()
+
+
+def test_results_dialog_shows_final_files_only() -> None:
+    application()
+    session = WorkspaceSession(display_name="Тест")
+    session.generated_file_groups = [
+        {
+            "node_id": "n1",
+            "node_title": "Task Executor",
+            "iteration": 1,
+            "color": "#7C3AED",
+            "intermediate": ["C:/tmp/step.png"],
+            "result": ["C:/tmp/final.md"],
+        }
+    ]
+    dialog = ResultsDialog(session)
+    assert dialog.result_paths() == ["C:/tmp/final.md"]
+    dialog.deleteLater()
+
+
+def test_switching_to_finished_workspace_requests_results(monkeypatch) -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    session.run_state = "completed"
+    session.unread_result = True
+    shown: list[str] = []
+    monkeypatch.setattr(
+        MainWindow, "show_run_results", lambda self: shown.append("shown")
+    )
+    window.select_workspace(session.id)
+    QApplication.processEvents()
+    assert shown == ["shown"]
+    session.dirty = False
+    window.dirty = False
+    window.close()
 
 
 def test_dragging_an_output_shows_preview_and_connects_to_input() -> None:
@@ -793,7 +1424,7 @@ def test_port_labels_follow_the_run_counters() -> None:
     assert scene.node_items[result.id].output_ports["false"].label == "FALSE 2/3"
 
 
-def test_attention_blinking_starts_and_stops() -> None:
+def test_attention_pulsing_starts_and_stops() -> None:
     application()
     result = FlowNode.create("result")
     scene = FlowScene()
@@ -801,10 +1432,10 @@ def test_attention_blinking_starts_and_stops() -> None:
 
     scene.set_attention(result.id, True)
     assert scene.node_items[result.id].attention is True
-    assert scene._blink_timer.isActive() is True
+    assert scene._running_timer.isActive() is True
 
     scene.set_attention(result.id, False)
-    assert scene._blink_timer.isActive() is False
+    assert scene._running_timer.isActive() is False
 
 
 def test_node_displays_live_and_completed_runtime() -> None:
@@ -925,18 +1556,12 @@ def test_node_console_messages_use_node_color_and_underline_files(
         },
     )
 
-    plain = window.log_view.toPlainText()
+    plain = window.log_panel.view.toPlainText()
     assert f"{node.short_id}: готово" in plain
-    path_offset = plain.index(str(output))
-    path_cursor = QTextCursor(window.log_view.document())
-    path_cursor.setPosition(path_offset)
-    path_cursor.setPosition(
-        path_offset + len(str(output)), QTextCursor.MoveMode.KeepAnchor
-    )
-    assert path_cursor.charFormat().fontUnderline() is True
+    assert "flowai-file:" in window.log_panel.view.toHtml()
 
     id_offset = plain.index(node.short_id)
-    color_cursor = QTextCursor(window.log_view.document())
+    color_cursor = QTextCursor(window.log_panel.view.document())
     color_cursor.setPosition(id_offset)
     assert color_cursor.charFormat().foreground().color().name().upper() == "#3B82F6"
     session.dirty = False
@@ -1032,10 +1657,7 @@ def test_files_dialog_groups_node_files_in_generation_order(tmp_path: Path) -> N
     assert heading.child(0).child(0).text(1) == str(intermediate.resolve())
     assert heading.child(1).text(0) == "Результат"
     assert heading.child(1).child(0).text(1) == str(result.resolve())
-    assert (
-        heading.child(1).child(0).foreground(0).color().name().upper()
-        == NODE_COLORS[node.kind]
-    )
+    assert heading.child(1).child(0).foreground(0).color().name() == "#e5e7eb"
     second_heading = dialog.tree.topLevelItem(1)
     assert second_heading is not None
     assert reviewer.title in second_heading.text(0)
@@ -1047,6 +1669,28 @@ def test_files_dialog_groups_node_files_in_generation_order(tmp_path: Path) -> N
         == NODE_COLORS[reviewer.kind]
     )
     dialog.close()
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_first_watched_file_creates_active_node_group(tmp_path: Path) -> None:
+    application()
+    generated = tmp_path / "script-output.png"
+    generated.write_bytes(b"image")
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None and session.workflow is not None
+    executor = session.workflow.nodes_of_kind("executor")[0]
+    session.active_file_node_id = executor.id
+    session.active_file_iteration = 1
+
+    window._intermediate_file(session.id, str(generated))
+
+    assert len(session.generated_file_groups) == 1
+    assert session.generated_file_groups[0]["node_id"] == executor.id
+    assert session.generated_file_groups[0]["intermediate"] == [str(generated)]
     session.dirty = False
     window.dirty = False
     window.close()
@@ -1278,11 +1922,45 @@ def test_parameters_lock_during_run_but_result_controls_remain_live() -> None:
     assert inspector.false_limit.isEnabled() is True
     assert inspector.wait_for_confirmation.isEnabled() is True
     inspector.false_limit.setValue(7)
+    inspector.wait_for_confirmation.setChecked(True)
     assert result.config["false_limit"] == 7
+    assert result.config["wait_for_confirmation"] is True
 
     inspector.set_execution_locked(False)
     assert inspector.template_edit.isEnabled() is True
     inspector.close()
+
+
+def test_canvas_uses_high_fps_only_while_running() -> None:
+    application()
+    scene = FlowScene()
+    workflow = Workflow(name="Тест")
+    node = FlowNode.create("executor")
+    workflow.nodes = [node]
+    scene.set_workflow(workflow)
+    assert not scene._running_timer.isActive()
+    scene.set_node_status(node.id, "running")
+    assert scene._running_timer.isActive()
+    assert scene._running_timer.interval() <= 17
+    scene.set_node_status(node.id, "success")
+    assert not scene._running_timer.isActive()
+
+
+def test_active_edge_animates_dashes() -> None:
+    application()
+    scene = FlowScene()
+    workflow = Workflow(name="Тест")
+    first = FlowNode.create("executor")
+    second = FlowNode.create("task_reviewer")
+    edge = FlowEdge.create(first.id, second.id)
+    workflow.nodes = [first, second]
+    workflow.edges = [edge]
+    scene.set_workflow(workflow)
+    item = scene.edge_items[edge.id]
+    assert item.is_active is False
+    scene.set_active_edge(edge.id)
+    assert item.is_active is True
+    assert scene._running_timer.isActive()
 
 
 def test_parameters_combo_and_spin_ignore_mouse_wheel() -> None:

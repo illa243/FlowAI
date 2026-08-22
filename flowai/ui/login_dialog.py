@@ -7,7 +7,6 @@ from typing import Any
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
-    QDialog,
     QLabel,
     QProgressBar,
     QPushButton,
@@ -16,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..codex_auth import CodexUser, read_codex_user_from_client
+from .motion import AnimatedDialog
 
 LOGGER = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ class LoginWorker(QObject):
                 LOGGER.warning("Codex login cancellation failed", exc_info=True)
 
 
-class ChatGPTLoginDialog(QDialog):
+class ChatGPTLoginDialog(AnimatedDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.user: CodexUser | None = None

@@ -6,10 +6,37 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 LOGGER = logging.getLogger(__name__)
+FALLBACK_MODELS = ("gpt-5.6-terra", "gpt-5.6-terra-max", "gpt-5.6-flex")
 
 
 class CodexAuthError(RuntimeError):
     pass
+
+
+def available_models() -> list[str]:
+    """Return account models, falling back to the known composer set."""
+    try:
+        import openai_codex
+
+        with openai_codex.Codex() as codex:
+            response = codex.models()
+            items = getattr(response, "models", None)
+            if items is None:
+                items = getattr(response, "data", [])
+            names = [
+                str(
+                    getattr(item, "id", "")
+                    or getattr(item, "model", "")
+                    or getattr(item, "name", "")
+                )
+                for item in items
+            ]
+            cleaned = list(dict.fromkeys(name for name in names if name))
+            if cleaned:
+                return cleaned
+    except Exception:
+        LOGGER.info("Не вдалося отримати список моделей", exc_info=True)
+    return list(FALLBACK_MODELS)
 
 
 @dataclass(frozen=True, slots=True)

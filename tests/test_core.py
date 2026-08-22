@@ -12,10 +12,64 @@ import pytest
 from flowai import codex_adapter
 from flowai import engine as engine_module
 from flowai.engine import InterventionRequired, RunCheckpoint, WorkflowRunner
-from flowai.models import FlowEdge, FlowNode, UnsupportedFlowFormat, Workflow
+from flowai.models import (
+    NODE_COLORS,
+    NODE_LABELS,
+    FlowEdge,
+    FlowNode,
+    UnsupportedFlowFormat,
+    Workflow,
+)
 from flowai.persistence import load_workflow, save_workflow
 from flowai.templating import render_template, safe_eval
 from flowai.work_review import PROTOCOL_NAME, REPORT_NAME
+
+
+def test_agent_defaults_carry_an_empty_skill_list() -> None:
+    node = FlowNode.create("executor")
+    assert node.config["skills"] == []
+
+
+def test_old_flow_files_get_the_skill_field() -> None:
+    raw = {
+        "format_version": 2,
+        "name": "Старий",
+        "nodes": [
+            {
+                "id": "a" * 32,
+                "kind": "executor",
+                "title": "Виконавець",
+                "config": {},
+            }
+        ],
+        "edges": [],
+    }
+    workflow = Workflow.from_dict(raw)
+    assert workflow.nodes[0].config["skills"] == []
+
+
+def test_build_input_prepends_pinned_skills() -> None:
+    import openai_codex
+
+    adapter = codex_adapter.CodexAdapter()
+    adapter._module = openai_codex
+    items = adapter._build_input(
+        "текст",
+        [],
+        [{"name": "image-cutout", "path": "C:/skills/image-cutout"}],
+    )
+    assert isinstance(items, list)
+    assert type(items[0]).__name__ == "SkillInput"
+    assert items[0].name == "image-cutout"
+    assert type(items[-1]).__name__ == "TextInput"
+
+
+def test_build_input_without_skills_is_a_plain_string() -> None:
+    import openai_codex
+
+    adapter = codex_adapter.CodexAdapter()
+    adapter._module = openai_codex
+    assert adapter._build_input("текст", [], []) == "текст"
 
 
 @pytest.fixture(autouse=True)
@@ -107,6 +161,39 @@ def test_template_and_safe_expression() -> None:
     assert safe_eval('score >= 80 and status == "ready"', context) is True
 
 
+def test_existing_input_files_avoids_realpath_for_arbitrary_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    generated = tmp_path / "generated.png"
+    generated.write_bytes(b"image")
+
+    def fail_resolve(*args: object, **kwargs: object) -> Path:
+        raise AssertionError("Path.resolve must not run while scanning agent text")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+
+    files = WorkflowRunner._existing_input_files(
+        {
+            "message": "This is a normal agent status message, not a path.",
+            "files": ["generated.png", str(generated)],
+        },
+        tmp_path,
+    )
+
+    assert files == [str(generated.absolute())]
+
+
+def test_existing_input_files_handles_cyclic_containers(tmp_path: Path) -> None:
+    generated = tmp_path / "generated.png"
+    generated.write_bytes(b"image")
+    cyclic: list[object] = ["generated.png"]
+    cyclic.append(cyclic)
+
+    assert WorkflowRunner._existing_input_files(cyclic, tmp_path) == [
+        str(generated.absolute())
+    ]
+
+
 def test_cycle_through_result_is_allowed(tmp_path: Path) -> None:
     pipeline = Pipeline(tmp_path)
     assert pipeline.workflow.validate() == []
@@ -181,10 +268,11 @@ def test_tasks_manager_processes_each_task_and_finishes(
     assert checkpoint.iterations[manager.id] == 3
     assert checkpoint.iterations[reviewer.id] == 2
     assert checkpoint.port_counts[f"{result.id}:true"] == 2
-    assert checkpoint.task_progress[manager.id] == {
-        "active_task_id": "",
-        "completed_task_ids": ["task-one", "task-two"],
-    }
+    progress = checkpoint.task_progress[manager.id]
+    assert progress["active_task_id"] == ""
+    assert progress["completed_task_ids"] == ["task-one", "task-two"]
+    assert set(progress["times"]) == {"task-one", "task-two"}
+    assert all(record["seconds"] >= 0 for record in progress["times"].values())
     assert runner.outputs[manager.id].data["branch"] == "done"
     progress = [event for event in events if event["type"] == "tasks_progress"]
     assert [event["completed_count"] for event in progress] == [0, 1, 2]
@@ -230,14 +318,27 @@ def test_format_one_is_rejected_with_a_clear_message() -> None:
 
 def test_round_trip_persistence(tmp_path: Path) -> None:
     pipeline = Pipeline(tmp_path)
+    pipeline.executor.width = 360
+    pipeline.executor.height = 240
     target = save_workflow(pipeline.workflow, tmp_path / "flow")
     restored = load_workflow(target)
     assert restored.format_version == 2
     assert [node.kind for node in restored.nodes] == [
         node.kind for node in pipeline.workflow.nodes
     ]
+    restored_executor = restored.node(pipeline.executor.id)
+    assert restored_executor.width == 360
+    assert restored_executor.height == 240
     back = next(edge for edge in restored.edges if edge.source_port == "false")
     assert back.target == pipeline.executor.id
+
+    old_layout = pipeline.workflow.to_dict()
+    for raw_node in old_layout["nodes"]:
+        raw_node.pop("width")
+        raw_node.pop("height")
+    restored_old_layout = Workflow.from_dict(old_layout)
+    assert all(node.width == 220 for node in restored_old_layout.nodes)
+    assert all(node.height == 130 for node in restored_old_layout.nodes)
 
 
 def test_loop_reruns_executor_until_reviewer_accepts(
@@ -456,6 +557,49 @@ def test_result_limits_can_be_updated_while_an_agent_is_running(
     assert runner.outputs[pipeline.result.id].data["verdict"] is True
 
 
+def test_result_confirmation_can_be_enabled_while_an_agent_is_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_executor = threading.Event()
+    executor_started = threading.Event()
+
+    def responder(call: dict[str, Any]) -> str:
+        if call["model"] == "executor-model":
+            executor_started.set()
+            assert release_executor.wait(2)
+            return "work"
+        if call["model"] == "reviewer-model":
+            return json.dumps(
+                {"verdict": True, "score": 90, "reason": "QA", "must_fix": []}
+            )
+        if call["model"] == "improver-model":
+            return json.dumps({"improved_prompt": "Task", "notes": []})
+        return "work"
+
+    monkeypatch.setattr(codex_adapter, "FAKE_RESPONDER", responder)
+    pipeline = Pipeline(tmp_path)
+    runner = WorkflowRunner(pipeline.workflow, run_directory=tmp_path / "runs")
+    outcome: list[RunCheckpoint] = []
+    thread = threading.Thread(target=lambda: outcome.append(runner.run()))
+    thread.start()
+    assert executor_started.wait(2)
+
+    assert (
+        runner.update_node_config(
+            pipeline.result.id, {"wait_for_confirmation": True}
+        )
+        is True
+    )
+    release_executor.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert outcome[0].port_counts == {}
+    waiting = runner.outputs[pipeline.result.id]
+    assert waiting.status == "waiting"
+    assert waiting.data["request"]["type"] == "result_confirmation"
+
+
 def test_runner_waits_while_system_is_paused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -597,41 +741,44 @@ def test_required_artifact_must_be_updated_in_the_current_pass(
     assert "не оновила артефакт" in runner.outputs[executor.id].error
 
 
-def test_merge_items_project_selects_quest_slots_before_generation() -> None:
+def test_merge_items_project_uses_the_five_stage_tasks_manager_loop() -> None:
     project_path = (
         Path(__file__).resolve().parents[1]
         / "!_projects"
+        / "Merge_items_generator"
         / "Merge_items_generator.flowai.json"
     )
     workflow = load_workflow(project_path)
 
     assert workflow.validate() == []
+    manager = workflow.nodes_of_kind("tasks_manager")[0]
     planner = workflow.nodes_of_kind("prompt_reviewer")[0]
     executor = workflow.nodes_of_kind("executor")[0]
     reviewer = workflow.nodes_of_kind("task_reviewer")[0]
     result = workflow.nodes_of_kind("result")[0]
 
-    required_counts = planner.config["output_schema"]["slot_plan"]["required_counts"]
-    assert required_counts == {"restore": 11, "remove": 2, "quests": 10}
-    assert planner.title == "Вибір квестових предметів"
-    assert any(
-        str(path).endswith("FIRST_LOCATION_FLAMBE_AUDIT.md")
-        for path in planner.config["attachments"]
-    )
-    assert "substitution_reason" in planner.config["instructions"]
+    tasks = manager.config["tasks"]
+    assert [task["id"] for task in tasks] == [
+        "task_01_select_restore_remove",
+        "task_02_define_damage_language",
+        "task_03_build_immutable_base",
+        "task_04_extract_restored_assets",
+        "task_05_generate_broken_and_assemble",
+    ]
+    assert all(len(task["attachments"]) >= 3 for task in tasks)
+    assert "RESTORE" in tasks[0]["prompt"]
+    assert "ENVIRONMENT OVERLAYS" in tasks[2]["prompt"]
 
     assert any(
-        edge.source == planner.id
-        and edge.target == executor.id
-        and edge.source_path == "data.slot_plan"
-        and edge.target_variable == "slot_plan"
+        edge.source == manager.id
+        and edge.target == planner.id
+        and edge.source_port == "next"
         for edge in workflow.edges
     )
     assert any(
-        edge.source == executor.id
-        and edge.target == reviewer.id
-        and edge.source_path == "data.slot_plan"
-        and edge.target_variable == "slot_plan"
+        edge.source == result.id
+        and edge.target == manager.id
+        and edge.source_port == "true"
         for edge in workflow.edges
     )
     assert any(
@@ -641,10 +788,12 @@ def test_merge_items_project_selects_quest_slots_before_generation() -> None:
         and edge.source_path == "data.retry_context"
         for edge in workflow.edges
     )
-    assert "previous_review.slot_plan" in executor.config["instructions"]
-    assert executor.config["required_output_path"].endswith("final_broken.png")
-    assert reviewer.config["output_schema"]["counts"]["expected_restore"] == 11
-    assert reviewer.config["output_schema"]["counts"]["expected_remove"] == 2
+    assert planner.config["output_schema"]["stage"] == "1/5|2/5|3/5|4/5|5/5"
+    assert executor.config["output_schema"]["task_id"] == "task_01...task_05"
+    assert reviewer.config["criteria_node"] == manager.id
+    assert reviewer.config["sandbox"] == "read-only"
+    assert "score>=95" in reviewer.config["instructions"]
+    assert result.config["true_limit"] == 5
 
 
 def test_forced_branch_skips_the_verdict(
@@ -859,3 +1008,322 @@ def test_intervention_required_carries_its_request() -> None:
     error = InterventionRequired({"question": "Що робимо?", "type": "result_limit"})
     assert error.request["type"] == "result_limit"
     assert "Що робимо?" in str(error)
+
+
+def test_interrupted_turn_raises_instead_of_returning_empty_text() -> None:
+    """Перерваний хід не має тихо ставати успішним результатом ноди."""
+
+    class FakeStatus:
+        value = "interrupted"
+
+    class FakeResult:
+        status = FakeStatus()
+        final_response = ""
+        items: tuple[Any, ...] = ()
+
+    with pytest.raises(codex_adapter.TurnInterrupted):
+        codex_adapter.agent_run_from_turn(FakeResult(), thread_id="thread-1")
+
+
+def test_completed_turn_returns_agent_run() -> None:
+    class FakeStatus:
+        value = "completed"
+
+    class FakeResult:
+        status = FakeStatus()
+        final_response = "готово"
+        items: tuple[Any, ...] = ()
+
+    run = codex_adapter.agent_run_from_turn(FakeResult(), thread_id="thread-1")
+    assert run.text == "готово"
+    assert run.thread_id == "thread-1"
+
+
+def test_pause_does_not_interrupt_active_turn(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    runner = WorkflowRunner(pipeline.workflow)
+    interrupts: list[str] = []
+
+    class FakeCodex:
+        def cancel_active(self) -> bool:
+            interrupts.append("called")
+            return True
+
+    runner._active_codex = FakeCodex()  # type: ignore[assignment]
+    runner.pause("тест")
+    assert interrupts == []
+    assert not runner._resume_event.is_set()
+    runner.resume("тест")
+    assert runner._resume_event.is_set()
+
+
+def test_tasks_manager_measures_time_per_task(tmp_path: Path) -> None:
+    workflow = Workflow(name="Черга", workspace=str(tmp_path))
+    manager = FlowNode.create("tasks_manager")
+    manager.config["tasks"] = [
+        {"id": "t1", "prompt": "Перше", "attachments": []},
+        {"id": "t2", "prompt": "Друге", "attachments": []},
+    ]
+    workflow.nodes = [manager]
+    runner = WorkflowRunner(workflow)
+
+    first = runner._execute_tasks_manager(manager)
+    assert first.data["task"]["id"] == "t1"
+    assert first.data["tasks"][0]["seconds"] == 0.0
+
+    time.sleep(0.05)
+    second = runner._execute_tasks_manager(manager)
+    states = {item["id"]: item for item in second.data["tasks"]}
+    assert states["t1"]["status"] == "completed"
+    assert states["t1"]["seconds"] >= 0.05
+    assert states["t2"]["status"] == "running"
+    assert second.data["total_seconds"] >= 0.05
+
+
+def test_agent_run_collects_token_usage() -> None:
+    class FakeStatus:
+        value = "completed"
+
+    class FakeBreakdown:
+        input_tokens = 100
+        cached_input_tokens = 20
+        output_tokens = 30
+        reasoning_output_tokens = 10
+        total_tokens = 160
+
+    class FakeUsage:
+        last = FakeBreakdown()
+        model_context_window = 400000
+
+    class FakeResult:
+        status = FakeStatus()
+        final_response = "готово"
+        items: tuple[Any, ...] = ()
+        usage = FakeUsage()
+
+    run = codex_adapter.agent_run_from_turn(FakeResult(), thread_id="t")
+    assert run.usage["total_tokens"] == 160
+    assert run.usage["reasoning_output_tokens"] == 10
+    assert run.context_window == 400000
+
+
+def test_node_result_carries_usage(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    runner = WorkflowRunner(pipeline.workflow)
+    checkpoint = runner.run()
+    executor_output = checkpoint.outputs[pipeline.executor.id]
+    assert executor_output["data"]["usage"]["total_tokens"] > 0
+    assert executor_output["data"]["usage"]["context_window"] == 400000
+
+
+def test_stream_activity_reaches_engine(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    events: list[dict[str, Any]] = []
+    runner = WorkflowRunner(
+        pipeline.workflow, on_event=lambda event: events.append(event)
+    )
+    runner.run()
+    activity = [item for item in events if item["type"] == "agent_activity"]
+    assert activity, "Рушій має емітити хід агента"
+    assert activity[0]["node_id"]
+    assert activity[0]["message"]
+
+
+def test_grill_summary_reaches_prompt_reviewer(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    pipeline.workflow.grill_summary = "Ринок: мобільні ігри"
+    pipeline.improver.config["prompt"] = "{{entry_prompt}}\n{{grill_summary}}"
+    runner = WorkflowRunner(pipeline.workflow)
+    runner.run()
+    improver_call = next(
+        call for call in codex_adapter.FAKE_CALLS if call["model"] == "improver-model"
+    )
+    assert "Ринок: мобільні ігри" in improver_call["prompt"]
+
+
+def test_result_has_exhausted_port_and_attempt_limit() -> None:
+    result = FlowNode.create("result")
+    assert result.config["task_attempt_limit"] == 2
+    workflow = Workflow(nodes=[result])
+    assert workflow.ports_of(result.id) == ("true", "false", "exhausted")
+
+
+def test_exhausted_edge_must_target_tasks_manager() -> None:
+    workflow = Workflow()
+    result = FlowNode.create("result")
+    executor = FlowNode.create("executor")
+    workflow.nodes = [result, executor]
+    workflow.edges = [FlowEdge.create(result.id, executor.id, "exhausted")]
+    errors = workflow.validate()
+    assert any("EXHAUSTED" in error for error in errors)
+
+
+def test_exhausted_target_returns_manager() -> None:
+    workflow = Workflow()
+    result = FlowNode.create("result")
+    manager = FlowNode.create("tasks_manager")
+    workflow.nodes = [result, manager]
+    workflow.edges = [FlowEdge.create(result.id, manager.id, "exhausted")]
+    assert workflow.exhausted_target(result.id) is manager
+
+
+def _task_budget_workflow(
+    tmp_path: Path, *, with_exhausted: bool
+) -> tuple[Workflow, FlowNode, FlowNode]:
+    manager = FlowNode.create("tasks_manager")
+    manager.config["tasks"] = [
+        {"id": "t1", "prompt": "Перше", "attachments": []},
+        {"id": "t2", "prompt": "Друге", "attachments": []},
+    ]
+    executor = FlowNode.create("executor")
+    executor.config["model"] = "executor-model"
+    reviewer = FlowNode.create("task_reviewer")
+    reviewer.config["model"] = "reviewer-model"
+    result = FlowNode.create("result")
+    result.config["task_attempt_limit"] = 2
+    result.config["false_limit"] = 99
+    manager_to_executor = FlowEdge.create(manager.id, executor.id, "next")
+    manager_to_executor.source_path = "data.prompt"
+    manager_to_executor.target_variable = "prompt"
+    executor_to_reviewer = FlowEdge.create(executor.id, reviewer.id)
+    executor_to_reviewer.source_path = "data"
+    executor_to_reviewer.target_variable = "work"
+    reviewer_to_result = FlowEdge.create(reviewer.id, result.id)
+    reviewer_to_result.source_path = "data"
+    reviewer_to_result.target_variable = "review"
+    retry = FlowEdge.create(result.id, executor.id, "false")
+    retry.source_path = "data.retry_context"
+    retry.target_variable = "prompt"
+    edges = [
+        manager_to_executor,
+        executor_to_reviewer,
+        reviewer_to_result,
+        retry,
+        FlowEdge.create(result.id, manager.id, "true"),
+    ]
+    if with_exhausted:
+        edges.append(FlowEdge.create(result.id, manager.id, "exhausted"))
+    workflow = Workflow(
+        name="Бюджет завдань",
+        workspace=str(tmp_path),
+        nodes=[manager, executor, reviewer, result],
+        edges=edges,
+    )
+    return workflow, manager, result
+
+
+def test_task_exhausts_own_attempt_budget(tmp_path: Path) -> None:
+    workflow, manager, result = _task_budget_workflow(
+        tmp_path, with_exhausted=True
+    )
+
+    def always_reject(call: dict[str, Any]) -> str:
+        if call["model"] == "reviewer-model":
+            return json.dumps(
+                {"verdict": False, "score": 1, "reason": "ні", "must_fix": ["фікс"]}
+            )
+        return "робота"
+
+    codex_adapter.FAKE_RESPONDER = always_reject
+    checkpoint = WorkflowRunner(workflow).run()
+
+    progress = checkpoint.task_progress[manager.id]
+    assert progress["failed_task_ids"] == ["t1", "t2"]
+    assert checkpoint.task_attempts[f"{result.id}:t1"] == 2
+    assert checkpoint.task_attempts[f"{result.id}:t2"] == 2
+    assert all(
+        state["status"] == "failed"
+        for state in checkpoint.outputs[manager.id]["data"]["tasks"]
+    )
+
+
+def test_without_exhausted_edge_old_dialog_still_fires(tmp_path: Path) -> None:
+    workflow, _manager, result = _task_budget_workflow(
+        tmp_path, with_exhausted=False
+    )
+    result.config["task_attempt_limit"] = 1
+    result.config["false_limit"] = 1
+    codex_adapter.FAKE_RESPONDER = lambda call: (
+        json.dumps({"verdict": False, "score": 1, "reason": "ні", "must_fix": []})
+        if call["model"] == "reviewer-model"
+        else "робота"
+    )
+    checkpoint = WorkflowRunner(workflow).run()
+    waiting = [
+        item for item in checkpoint.outputs.values() if item.get("status") == "waiting"
+    ]
+    assert waiting, "Без жовтого ребра має спрацювати старий діалог ліміту"
+
+
+def test_fake_run_records_pinned_skills(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    pipeline.executor.config["skills"] = [
+        {"name": "birds-map", "path": str(tmp_path / "birds-map")}
+    ]
+    WorkflowRunner(pipeline.workflow).run()
+    call = next(
+        item for item in codex_adapter.FAKE_CALLS if item["model"] == "executor-model"
+    )
+    assert call["skills"] == ["birds-map"]
+
+
+def test_calibrator_is_a_registered_node_kind() -> None:
+    assert NODE_LABELS["calibrator"] == "Calibration Stop"
+    assert NODE_COLORS["calibrator"] == "#E11D48"
+    node = FlowNode.create("calibrator")
+    assert node.config["false_threshold"] == 1
+    assert node.config["sandbox"] == "read-only"
+    assert node.config["output_format"] == "json"
+    assert node.config["thread_source"] == ""
+    assert node.is_agent is True
+
+
+def test_calibrator_has_no_output_ports() -> None:
+    workflow = Workflow()
+    node = FlowNode.create("calibrator")
+    workflow.nodes.append(node)
+    assert workflow.ports_of(node.id) == ()
+
+
+def test_calibrator_must_hang_on_the_false_port(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    stop = FlowNode.create("calibrator")
+    pipeline.workflow.nodes.append(stop)
+    pipeline.workflow.edges.append(FlowEdge.create(pipeline.result.id, stop.id, "true"))
+    errors = pipeline.workflow.validate()
+    assert any("Calibration Stop" in error and "FALSE" in error for error in errors)
+
+
+def test_calibrator_on_the_false_port_validates(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    stop = FlowNode.create("calibrator")
+    pipeline.workflow.nodes.append(stop)
+    pipeline.workflow.edges.append(
+        FlowEdge.create(pipeline.result.id, stop.id, "false")
+    )
+    assert pipeline.workflow.validate() == []
+    assert pipeline.workflow.calibrator_for(pipeline.result.id) is stop
+
+
+def test_only_one_calibrator_per_result(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    for _ in range(2):
+        stop = FlowNode.create("calibrator")
+        pipeline.workflow.nodes.append(stop)
+        pipeline.workflow.edges.append(
+            FlowEdge.create(pipeline.result.id, stop.id, "false")
+        )
+    errors = pipeline.workflow.validate()
+    assert any("лише один" in error for error in errors)
+
+
+def test_calibrator_cannot_be_a_source(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    stop = FlowNode.create("calibrator")
+    pipeline.workflow.nodes.append(stop)
+    pipeline.workflow.edges.append(
+        FlowEdge.create(pipeline.result.id, stop.id, "false")
+    )
+    pipeline.workflow.edges.append(FlowEdge.create(stop.id, pipeline.executor.id, "out"))
+    errors = pipeline.workflow.validate()
+    assert any("не має вихідних портів" in error for error in errors)

@@ -14,8 +14,8 @@ from uuid import uuid4
 
 from PySide6.QtCore import (
     QObject,
+    QPoint,
     QPointF,
-    QRectF,
     QSettings,
     QSize,
     Qt,
@@ -33,10 +33,7 @@ from PySide6.QtGui import (
     QIcon,
     QKeySequence,
     QPainter,
-    QPainterPath,
     QPixmap,
-    QTextCharFormat,
-    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -60,6 +57,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStyle,
     QSystemTrayIcon,
+    QTabWidget,
     QToolBar,
     QToolButton,
     QTreeWidget,
@@ -68,8 +66,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..apply_edits import apply_edits, pin_skills
+from ..calibration import CalibrationReport, save_report
 from ..codex_auth import CodexRateLimit, CodexUser, logout_codex_user, read_codex_user
 from ..engine import RunCheckpoint, WorkflowRunner
+from ..grill import GrillOutcome
 from ..logging_setup import log_paths, record_background_exception
 from ..models import (
     NODE_COLORS,
@@ -78,12 +79,36 @@ from ..models import (
     FlowNode,
     UnsupportedFlowFormat,
     Workflow,
+    normalize_managed_tasks,
 )
 from ..persistence import FLOW_SUFFIX, load_workflow, save_workflow
+from ..project_layout import isolated_flow_path, relocated_project_path
+from ..run_history import (
+    clear_checkpoint,
+    find_pending_run,
+    load_checkpoint,
+    save_checkpoint,
+)
+from ..skills import SKILLS_ROOT
 from ..workspaces import WorkspaceSession
+from .branding import APP_USER_MODEL_ID, application_icon
+from .calibration_dialog import CalibrationDialog
 from .canvas import FlowScene, FlowView
+from .controls import AnimatedButton
+from .file_watch import RunFileWatcher
+from .flow_composer_dialog import FlowComposerDialog, NewFlowChoiceDialog
+from .grill_dialog import GrillDialog
+from .icons import icon
 from .inspector import Inspector
+from .log_panel import LogPanel
 from .login_dialog import ChatGPTLoginDialog
+from .motion import AnimatedDialog
+from .paths import open_file, path_menu
+from .results_dialog import ResultsDialog
+from .run_start_dialog import RunStartDialog
+from .skills_page import SkillsPage
+from .stats_dialog import StatsDialog
+from .toast import ToastAction, Toaster
 from .workspace_sidebar import ResponsiveListWidget, WorkspaceSidebar
 
 HISTORY_LIMIT = 100
@@ -92,6 +117,26 @@ WIDGET_SIZE_MAX = 16_777_215
 MAX_UI_LOG_CHARS = 500_000
 MAX_NODE_RESULT_PREVIEW = 4_000
 LAYOUT_SAVE_DELAY_MS = 300
+ACTIVITY_EVENT_MIN_INTERVAL_SECONDS = 0.1
+WORKSPACE_UI_EVENT_TYPES = frozenset(
+    {
+        "run_started",
+        "node_started",
+        "node_finished",
+        "node_failed",
+        "node_cancelled",
+        "node_waiting",
+        "work_review_started",
+        "work_review_finished",
+        "work_review_failed",
+        "intervention_required",
+        "run_paused",
+        "run_resumed",
+        "run_finished",
+        "run_failed",
+        "run_cancelled",
+    }
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -268,8 +313,16 @@ class RunWorker(QObject):
             intervention_responses=intervention_responses,
             run_directory=run_directory,
         )
+        self._last_activity_emit_at: dict[str, float] = {}
 
     def _forward_event(self, event: dict[str, Any]) -> None:
+        if event.get("type") == "agent_activity" and event.get("phase") != "completed":
+            node_id = str(event.get("node_id") or "")
+            now = time.monotonic()
+            last_emit = self._last_activity_emit_at.get(node_id, 0.0)
+            if now - last_emit < ACTIVITY_EVENT_MIN_INTERVAL_SECONDS:
+                return
+            self._last_activity_emit_at[node_id] = now
         self.message.emit(self.session_id, "event", event)
 
     @Slot()
@@ -338,29 +391,6 @@ def account_avatar_icon(initial: str, *, logged_in: bool) -> QIcon:
     return QIcon(pixmap)
 
 
-def settings_gear_icon() -> QIcon:
-    pixmap = QPixmap(24, 24)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.translate(12, 12)
-    color = QColor("#C4B5FD")
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(color)
-    for angle in range(0, 360, 45):
-        painter.save()
-        painter.rotate(angle)
-        painter.drawRoundedRect(QRectF(-2, -11, 4, 6), 1, 1)
-        painter.restore()
-    gear = QPainterPath()
-    gear.setFillRule(Qt.FillRule.OddEvenFill)
-    gear.addEllipse(-8, -8, 16, 16)
-    gear.addEllipse(-3, -3, 6, 6)
-    painter.drawPath(gear)
-    painter.end()
-    return QIcon(pixmap)
-
-
 def starter_workflow() -> Workflow:
     entry = FlowNode.create("entry", -640, -30)
     entry.config["text"] = "Опишіть, що потрібно зробити"
@@ -410,8 +440,14 @@ def starter_workflow() -> Workflow:
     )
 
 
-class WorkflowSettingsDialog(QDialog):
-    def __init__(self, workflow: Workflow, parent: QWidget | None = None) -> None:
+class WorkflowSettingsDialog(AnimatedDialog):
+    def __init__(
+        self,
+        workflow: Workflow,
+        parent: QWidget | None = None,
+        *,
+        codex: Any | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Налаштування Flow")
         self.setMinimumWidth(520)
@@ -449,11 +485,12 @@ class WorkflowSettingsDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("Назва", self.name_edit)
-        form.addRow("Основна робоча папка", workspace_box)
-        form.addRow("Додаткові папки", additional_box)
+        form.addRow("Папка джерел", workspace_box)
+        form.addRow("Додаткові джерела", additional_box)
         hint = QLabel(
-            "Якщо поле порожнє, використовується папка збереженого Flow. "
-            "Основна та додаткові папки проєкту доступні кожному AI-агенту."
+            "Тека зі збереженим Flow завжди є єдиною текою для запису. "
+            "Вказані тут зовнішні папки доступні агентам лише як джерела; "
+            "усі нові файли створюються всередині Flow-проєкту."
         )
         hint.setWordWrap(True)
         hint.setObjectName("mutedLabel")
@@ -464,9 +501,21 @@ class WorkflowSettingsDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        flow_tab = QWidget()
+        flow_layout = QVBoxLayout(flow_tab)
+        flow_layout.setContentsMargins(0, 0, 0, 0)
+        flow_layout.addLayout(form)
+        flow_layout.addStretch()
+
+        self.skills_page = SkillsPage(self, codex=codex)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(flow_tab, "Flow")
+        self.tabs.addTab(self.skills_page, "Skills")
+
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
+        layout.addWidget(self.tabs, 1)
         layout.addWidget(buttons)
+        self.setMinimumSize(880, 620)
 
     def _choose_workspace(self) -> None:
         directory = QFileDialog.getExistingDirectory(
@@ -506,7 +555,7 @@ class WorkflowSettingsDialog(QDialog):
         ]
 
 
-class GeneratedFilesDialog(QDialog):
+class GeneratedFilesDialog(AnimatedDialog):
     """Chronological files produced by the currently selected workspace run."""
 
     def __init__(
@@ -533,8 +582,10 @@ class GeneratedFilesDialog(QDialog):
         self.tree.setHeaderLabels(["Нода / файл", "Повний шлях"])
         self.tree.setColumnWidth(0, 310)
         self.tree.setUniformRowHeights(True)
-        self.tree.setAlternatingRowColors(True)
+        self.tree.setAlternatingRowColors(False)
         self.tree.itemDoubleClicked.connect(self._open_file)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._context_menu)
         layout.addWidget(self.tree, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -611,7 +662,7 @@ class GeneratedFilesDialog(QDialog):
         parent.addChild(section)
         if not paths and empty_text:
             placeholder = QTreeWidgetItem([empty_text, ""])
-            self._color_item(placeholder, color)
+            self._plain_item(placeholder)
             section.addChild(placeholder)
         for raw_path in paths:
             path = Path(raw_path)
@@ -622,7 +673,7 @@ class GeneratedFilesDialog(QDialog):
             item.setData(0, Qt.ItemDataRole.UserRole, raw_path)
             item.setToolTip(0, raw_path)
             item.setToolTip(1, raw_path)
-            self._color_item(item, color)
+            self._plain_item(item)
             section.addChild(item)
         section.setExpanded(True)
 
@@ -631,13 +682,28 @@ class GeneratedFilesDialog(QDialog):
         item.setForeground(0, color)
         item.setForeground(1, color)
 
+    @staticmethod
+    def _plain_item(item: QTreeWidgetItem) -> None:
+        item.setForeground(0, QColor("#E5E7EB"))
+        item.setForeground(1, QColor("#94A3B8"))
+
     def _open_file(self, item: QTreeWidgetItem, _column: int) -> None:
         raw_path = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
-        if raw_path and Path(raw_path).is_file():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(raw_path))
+        if raw_path:
+            open_file(raw_path)
+
+    def _context_menu(self, position: QPoint) -> None:
+        item = self.tree.itemAt(position)
+        if item is None:
+            return
+        raw_path = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+        if raw_path:
+            path_menu(raw_path, self).exec(
+                self.tree.viewport().mapToGlobal(position)
+            )
 
 
-class ResultLimitDialog(QDialog):
+class ResultLimitDialog(AnimatedDialog):
     """Гілка блока Result вичерпала ліміт проходів."""
 
     def __init__(self, request: dict[str, Any], parent: QWidget | None = None) -> None:
@@ -740,7 +806,7 @@ class ResultLimitDialog(QDialog):
         self.accept()
 
 
-class ResultConfirmationDialog(QDialog):
+class ResultConfirmationDialog(AnimatedDialog):
     """Manual checkpoint requested by a Result node."""
 
     def __init__(self, request: dict[str, Any], parent: QWidget | None = None) -> None:
@@ -810,7 +876,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setWindowTitle("FlowAI")
-        self.setWindowIcon(account_avatar_icon("F", logged_in=True))
+        self.setWindowIcon(application_icon())
         self.resize(1500, 920)
         self.setMinimumSize(1080, 700)
         self.setDockNestingEnabled(True)
@@ -840,9 +906,13 @@ class MainWindow(QMainWindow):
         self.account_worker: AccountWorker | None = None
         self.current_user: CodexUser | None = None
         self.current_run_events: list[dict[str, Any]] = []
+        self.calibration_models = [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ]
         self.intervention_dialog_open = False
         self._system_pause_reasons: set[str] = set()
-        self._wts_notifications_registered = False
         self._notification_target: tuple[str, str] | None = None
         self.history_timer = QTimer(self)
         self.history_timer.setSingleShot(True)
@@ -857,9 +927,7 @@ class MainWindow(QMainWindow):
         self.central_stack.addWidget(self.view)
         self.setCentralWidget(self.central_stack)
         self.inspector = Inspector()
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(10000)
+        self.log_panel = LogPanel()
 
         self._build_toolbar()
         self._build_workspace_sidebar()
@@ -939,9 +1007,23 @@ class MainWindow(QMainWindow):
         self.save_action.setShortcut(QKeySequence.StandardKey.Save)
         self.save_action.triggered.connect(self.save_workflow)
 
-        self.settings_action = QAction(settings_gear_icon(), "Settings", self)
+        self.settings_action = QAction(icon("settings"), "Settings", self)
         self.settings_action.triggered.connect(self.edit_workflow_settings)
-        toolbar.addAction(self.settings_action)
+        self.settings_button = AnimatedButton(
+            "Settings", variant="ghost", icon_name="settings"
+        )
+        self.settings_button.setDefaultAction(self.settings_action)
+        toolbar.addWidget(self.settings_button)
+
+        self.edit_flow_action = QAction(icon("sparkles"), "Edit Flow", self)
+        self.edit_flow_action.triggered.connect(self.edit_flow_with_ai)
+        self.edit_flow_button = AnimatedButton(
+            "Edit Flow", variant="ghost", icon_name="sparkles"
+        )
+        self.edit_flow_button.setObjectName("editFlowButton")
+        self.edit_flow_button.setToolTip("Змінити вибраний Flow за допомогою AI")
+        self.edit_flow_button.setDefaultAction(self.edit_flow_action)
+        toolbar.addWidget(self.edit_flow_button)
         toolbar.addSeparator()
 
         self.run_action = QAction("▶ Run", self)
@@ -952,18 +1034,31 @@ class MainWindow(QMainWindow):
         self.files_action = QAction("Files", self)
         self.files_action.setEnabled(False)
         self.files_action.triggered.connect(self.show_generated_files)
-        toolbar.addAction(self.run_action)
-        toolbar.addAction(self.stop_action)
-        toolbar.addAction(self.files_action)
-        self.run_button = toolbar.widgetForAction(self.run_action)
-        self.stop_button = toolbar.widgetForAction(self.stop_action)
-        self.files_button = toolbar.widgetForAction(self.files_action)
-        if self.run_button is not None:
-            self.run_button.setObjectName("runButton")
-        if self.stop_button is not None:
-            self.stop_button.setObjectName("stopButton")
-        if self.files_button is not None:
-            self.files_button.setObjectName("filesButton")
+        self.stats_action = QAction("Stats", self)
+        self.stats_action.setEnabled(False)
+        self.stats_action.triggered.connect(self.show_run_stats)
+        self.run_button = AnimatedButton("Run", variant="success", icon_name="play")
+        self.run_button.setDefaultAction(self.run_action)
+        self.stop_button = AnimatedButton(
+            "Stop", variant="danger", icon_name="square"
+        )
+        self.stop_button.setDefaultAction(self.stop_action)
+        self.files_button = AnimatedButton(
+            "Files", variant="secondary", icon_name="folder"
+        )
+        self.files_button.setDefaultAction(self.files_action)
+        self.stats_button = AnimatedButton(
+            "Stats", variant="secondary", icon_name="chart"
+        )
+        self.stats_button.setDefaultAction(self.stats_action)
+        for name, button in (
+            ("runButton", self.run_button),
+            ("stopButton", self.stop_button),
+            ("filesButton", self.files_button),
+            ("statsButton", self.stats_button),
+        ):
+            button.setObjectName(name)
+            toolbar.addWidget(button)
         toolbar.addSeparator()
 
         spacer = QWidget()
@@ -1012,14 +1107,10 @@ class MainWindow(QMainWindow):
         layout.setSpacing(4)
 
         self.node_list = ResponsiveListWidget()
-        self.node_list.setObjectName("nodePaletteList")
+        self.node_list.setObjectName("paletteList")
         self.node_list.setSpacing(4)
         self.node_list.setSelectionMode(ResponsiveListWidget.SelectionMode.NoSelection)
-        self.node_list.setStyleSheet(
-            "QListWidget#nodePaletteList { background: transparent; border: none; }"
-            "QListWidget#nodePaletteList::item { background: transparent; border: none; }"
-        )
-        self.node_buttons: list[QPushButton] = []
+        self.node_buttons: list[AnimatedButton] = []
         for kind in [
             "entry",
             "tasks_manager",
@@ -1027,11 +1118,14 @@ class MainWindow(QMainWindow):
             "executor",
             "task_reviewer",
             "result",
+            "calibrator",
             "work_reviewer",
         ]:
-            button = QPushButton(f"＋  {NODE_LABELS[kind]}")
-            button.setStyleSheet(
-                f"text-align: left; border-left: 4px solid {NODE_COLORS[kind]};"
+            button = AnimatedButton(
+                NODE_LABELS[kind],
+                variant="secondary",
+                icon_name="plus",
+                color=NODE_COLORS[kind],
             )
             button.clicked.connect(
                 lambda checked=False, node_kind=kind: self.add_node(node_kind)
@@ -1088,7 +1182,7 @@ class MainWindow(QMainWindow):
         clear.clicked.connect(self._clear_current_log)
         controls.addWidget(clear)
         layout.addLayout(controls)
-        layout.addWidget(self.log_view)
+        layout.addWidget(self.log_panel)
         dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
         dock.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         dock.set_resizable_widget(content)
@@ -1141,6 +1235,9 @@ class MainWindow(QMainWindow):
         self.tray_icon = QSystemTrayIcon(icon, self)
         self.tray_icon.setToolTip("FlowAI")
         self.tray_icon.messageClicked.connect(self._notification_clicked)
+        self.toaster = Toaster(APP_USER_MODEL_ID, self)
+        self.toaster.activated.connect(self._toast_activated)
+        self.calibration_open_tab = 0
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray_icon.show()
 
@@ -1152,16 +1249,34 @@ class MainWindow(QMainWindow):
         *,
         node_id: str = "",
         warning: bool = False,
+        actions: list[ToastAction] | None = None,
     ) -> None:
-        if self.isActiveWindow() or not QSystemTrayIcon.isSystemTrayAvailable():
+        """Сповістити поза фокусом: спершу тост, потім трей-балон."""
+        if self.isActiveWindow():
             return
         self._notification_target = (session.id, node_id)
+        if self.toaster.show(
+            title, message, tag=session.id, actions=list(actions or [])
+        ):
+            return
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
         icon = (
             QSystemTrayIcon.MessageIcon.Warning
             if warning
             else QSystemTrayIcon.MessageIcon.Information
         )
         self.tray_icon.showMessage(title, message, icon, 12_000)
+
+    @Slot(str, str)
+    def _toast_activated(self, tag: str, action: str) -> None:
+        """Підняти FlowAI й відкрити запитану вкладку калібрації."""
+        self.calibration_open_tab = 1 if action == "edits" else 0
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.select_workspace(tag)
+        QTimer.singleShot(0, lambda: self._show_pending_intervention(True))
 
     def _notification_clicked(self) -> None:
         target = self._notification_target
@@ -1189,7 +1304,21 @@ class MainWindow(QMainWindow):
         self.scene.add_node(kind, self.view.center_position() + QPointF(offset, offset))
 
     def new_workflow(self) -> None:
-        workflow = starter_workflow()
+        choice = "starter"
+        if self.isVisible():
+            chooser = NewFlowChoiceDialog(self)
+            if chooser.exec() != QDialog.DialogCode.Accepted:
+                return
+            choice = chooser.choice
+        if choice == "ai":
+            composer = FlowComposerDialog(self)
+            if (
+                composer.exec() == QDialog.DialogCode.Accepted
+                and composer.saved_path
+            ):
+                self._open_workflow_path(Path(composer.saved_path))
+            return
+        workflow = Workflow() if choice == "blank" else starter_workflow()
         session = WorkspaceSession(
             display_name=workflow.name,
             workflow=workflow,
@@ -1201,6 +1330,67 @@ class MainWindow(QMainWindow):
         self.select_workspace(session.id)
         QTimer.singleShot(20, self._fit_graph)
 
+    def edit_flow_with_ai(self) -> None:
+        """Edit only the selected Flow through the AI composer and MCP draft."""
+        session = self.current_workspace
+        if (
+            session is None
+            or session.workflow is None
+            or session.run_thread is not None
+        ):
+            return
+        if session.project_path is None and not self.save_workflow():
+            return
+        # The MCP editor loads the exact on-disk Flow into an isolated draft.
+        # Saving first includes any manual canvas changes and supplies a stable path.
+        if not self.save_workflow() or self.project_path is None:
+            return
+        target = self.project_path.resolve()
+        workspace = self.scene.workflow.resolved_workspace(target)
+        dialog = FlowComposerDialog(
+            self,
+            edit_path=target,
+            initial_workspace=workspace,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.saved_path:
+            return
+        try:
+            edited = load_workflow(Path(dialog.saved_path))
+            errors = edited.validate()
+            if errors:
+                raise ValueError("Змінений Flow не валідний:\n" + "\n".join(errors))
+        except Exception as exc:  # noqa: BLE001 - worker/UI file boundary
+            QMessageBox.critical(self, "Не вдалося відкрити змінений Flow", str(exc))
+            return
+        self._apply_ai_edited_workflow(session, edited)
+        self.statusBar().showMessage(f"AI змінив вибраний Flow: {target}", 7000)
+
+    def _apply_ai_edited_workflow(
+        self, session: WorkspaceSession, edited: Workflow
+    ) -> None:
+        """Adopt an already-saved AI edit while keeping the old Flow undoable."""
+        previous = self._workflow_snapshot(session.workflow or self.scene.workflow)
+        current = self._workflow_snapshot(edited)
+        if previous != current:
+            session.undo_history.append(previous)
+            if len(session.undo_history) > HISTORY_LIMIT:
+                del session.undo_history[:-HISTORY_LIMIT]
+        session.redo_history.clear()
+        session.workflow = edited
+        session.history_state = copy.deepcopy(current)
+        session.saved_history_state = copy.deepcopy(current)
+        session.display_name = edited.name
+        session.selected_object = None
+        session.dirty = False
+        self.dirty = False
+        self.scene.set_workflow(edited)
+        self.inspector.set_workflow(edited)
+        self._persist_workspace_registry()
+        self._refresh_workspace_sidebar()
+        self._update_title()
+        self._update_history_actions()
+        QTimer.singleShot(0, self._fit_graph)
+
     def open_workflow(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -1210,7 +1400,10 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        resolved = Path(path).resolve()
+        self._open_workflow_path(Path(path))
+
+    def _open_workflow_path(self, path: Path) -> None:
+        resolved = path.resolve()
         self._remember_directory(resolved.parent)
         existing = next(
             (
@@ -1275,6 +1468,7 @@ class MainWindow(QMainWindow):
         target = Path(path)
         if not target.name.lower().endswith(FLOW_SUFFIX):
             target = target.with_name(target.name + FLOW_SUFFIX)
+        target = isolated_flow_path(target)
         self._remember_directory(target.resolve().parent)
         other = next(
             (
@@ -1316,6 +1510,18 @@ class MainWindow(QMainWindow):
             or session.run_thread is not None
         ):
             return
+        if (
+            not resume
+            and self.isVisible()
+            and not bool(
+                self.settings.value("run/skip_start_dialog", False, type=bool)
+            )
+        ):
+            starter = RunStartDialog(self)
+            if starter.exec() != QDialog.DialogCode.Accepted:
+                return
+            if starter.choice == "grill" and not self._run_grill(session):
+                return
         errors = self.scene.workflow.validate()
         if errors:
             QMessageBox.warning(self, "Flow потребує виправлення", "\n".join(errors))
@@ -1344,10 +1550,12 @@ class MainWindow(QMainWindow):
             session.node_stages.clear()
             session.task_states.clear()
             session.port_counts.clear()
-            self.log_view.clear()
+            self.log_panel.clear()
             session.log_text = ""
             session.log_entries.clear()
             session.generated_file_groups.clear()
+            session.active_file_node_id = ""
+            session.active_file_iteration = 0
             session.run_events = []
             session.checkpoint = None
             session.intervention_responses = {}
@@ -1393,7 +1601,81 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
         session.run_thread = thread
         session.run_worker = worker
+        watcher = RunFileWatcher(self)
+        watcher.file_ready.connect(
+            lambda path, session_id=session.id: self._intermediate_file(
+                session_id, path
+            )
+        )
+        workflow = session.workflow
+        roots = [workflow.resolved_workspace(session.project_path)]
+        watcher.start(roots)
+        session.file_watcher = watcher
         thread.start()
+
+    def _grill_model(self, workflow: Workflow) -> str:
+        reviewers = workflow.nodes_of_kind("prompt_reviewer")
+        if reviewers:
+            return str(reviewers[0].config.get("model") or "gpt-5.6-terra")
+        return "gpt-5.6-terra"
+
+    def _apply_grill_outcome(
+        self, session: WorkspaceSession, outcome: GrillOutcome
+    ) -> None:
+        workflow = session.workflow
+        if workflow is None:
+            return
+        for node in workflow.nodes_of_kind("tasks_manager"):
+            tasks = normalize_managed_tasks(node.config.get("tasks"))
+            for task in tasks:
+                rewritten = outcome.rewritten_tasks.get(str(task["id"]))
+                if rewritten is not None:
+                    task["prompt"] = rewritten
+            node.config["tasks"] = tasks
+        if outcome.rewritten_entry:
+            for node in workflow.nodes_of_kind("entry"):
+                node.config["text"] = outcome.rewritten_entry
+        workflow.grill_summary = outcome.summary
+        self._mark_dirty()
+        self._commit_current_history()
+
+    def _run_grill(self, session: WorkspaceSession) -> bool:
+        """Run GrillMe. Return True when the Flow may start."""
+        workflow = session.workflow
+        if workflow is None:
+            return False
+        while True:
+            dialog = GrillDialog(
+                workflow,
+                self._grill_model(workflow),
+                workflow.resolved_workspace(session.project_path),
+                self,
+            )
+            dialog.exec()
+            if dialog.decision == "run" and dialog.outcome is not None:
+                self._apply_grill_outcome(session, dialog.outcome)
+                return True
+            if dialog.decision == "edit" and dialog.outcome is not None:
+                self._apply_grill_outcome(session, dialog.outcome)
+                managers = workflow.nodes_of_kind("tasks_manager")
+                if managers:
+                    item = self.scene.node_items.get(managers[0].id)
+                    if item is not None:
+                        self.scene.clearSelection()
+                        item.setSelected(True)
+                self.inspector.focus_first_task()
+                if (
+                    QMessageBox.question(
+                        self,
+                        "Продовжити уточнення?",
+                        "Промпти оновлено. Запустити GrillMe ще раз "
+                        "із вашими правками?",
+                    )
+                    != QMessageBox.StandardButton.Yes
+                ):
+                    return False
+                continue
+            return False
 
     @Slot(str, str, object)
     def _handle_run_worker_message(
@@ -1442,6 +1724,23 @@ class MainWindow(QMainWindow):
             return
         GeneratedFilesDialog(session, self).exec()
 
+    def show_run_stats(self) -> None:
+        session = self.current_workspace
+        if session is None:
+            return
+        StatsDialog(session, self).exec()
+
+    def show_run_results(self) -> None:
+        session = self.current_workspace
+        if session is None:
+            return
+        dialog = ResultsDialog(session, self)
+        dialog.all_files_button.clicked.connect(dialog.accept)
+        dialog.all_files_button.clicked.connect(self.show_generated_files)
+        dialog.stats_button.clicked.connect(dialog.accept)
+        dialog.stats_button.clicked.connect(self.show_run_stats)
+        dialog.exec()
+
     @Slot(str, object)
     def _handle_run_event(self, session_id: str, event: object) -> None:
         if not isinstance(event, dict):
@@ -1455,6 +1754,21 @@ class MainWindow(QMainWindow):
             self.current_run_events = session.run_events
         event_type = event.get("type", "event")
         node_id = event.get("node_id")
+        if event_type in {"node_started", "work_review_started"} and node_id:
+            session.active_file_node_id = str(node_id)
+            session.active_file_iteration = max(1, int(event.get("iteration", 1)))
+        if (
+            event_type
+            in {
+                "node_finished",
+                "node_failed",
+                "node_cancelled",
+                "work_review_finished",
+                "work_review_failed",
+            }
+            and session.file_watcher is not None
+        ):
+            session.file_watcher.rescan()
         if event_type in {"node_finished", "work_review_finished"}:
             self._record_generated_file_group(session, event)
         LOGGER.info(
@@ -1507,6 +1821,7 @@ class MainWindow(QMainWindow):
                     "id": str(item.get("id", "")),
                     "title": str(item.get("title", "")),
                     "status": str(item.get("status", "pending")),
+                    "seconds": float(item.get("seconds", 0.0) or 0.0),
                 }
                 for item in task_states
                 if isinstance(item, dict)
@@ -1514,6 +1829,26 @@ class MainWindow(QMainWindow):
             session.task_states[str(node_id)] = clean_states
             if session.id == self.current_workspace_id:
                 self.scene.set_task_states(str(node_id), clean_states)
+        if (
+            event_type == "node_started"
+            and node_id
+            and session.id == self.current_workspace_id
+            and session.workflow is not None
+        ):
+            incoming = session.workflow.incoming(str(node_id))
+            active = next(
+                (
+                    edge
+                    for edge in reversed(incoming)
+                    if session.node_statuses.get(edge.source)
+                    in {"success", "waiting"}
+                ),
+                None,
+            )
+            self.scene.set_active_edge(active.id if active is not None else "")
+        elif event_type in {"run_finished", "run_failed", "run_cancelled"}:
+            if session.id == self.current_workspace_id:
+                self.scene.set_active_edge("")
 
         title = event.get("node_title")
         message = event.get("message", "")
@@ -1584,10 +1919,28 @@ class MainWindow(QMainWindow):
                 f"{prefix}: {message}",
                 color=color,
             )
+        elif event_type == "agent_activity":
+            paths = [str(item) for item in event.get("paths", []) if str(item)]
+            if session.id == self.current_workspace_id:
+                self.log_panel.set_activity(str(message), color)
+            if str(event.get("phase")) == "completed":
+                self._append_session_log(
+                    session,
+                    f"{prefix}: {message}",
+                    color=color,
+                    file_paths=paths,
+                )
         elif event_type == "intervention_required":
             request = event.get("request")
             session.pending_intervention = request if isinstance(request, dict) else {}
             session.run_state = "needs_attention"
+            if session.run_directory is not None and session.checkpoint is not None:
+                save_checkpoint(
+                    session.run_directory,
+                    session.checkpoint,
+                    project_path=session.project_path,
+                    request=session.pending_intervention or {},
+                )
             self._append_session_log(
                 session,
                 f"{prefix}: ⚠ Потрібне втручання — {message}",
@@ -1604,12 +1957,16 @@ class MainWindow(QMainWindow):
         elif event_type == "node_config_updated":
             self._append_session_log(session, f"{prefix}: {message}", color=color)
         elif event_type == "tasks_progress":
+            total = float(event.get("total_seconds", 0.0) or 0.0)
             self._append_session_log(
                 session,
                 f"{prefix}: {message} "
-                f"({event.get('completed_count', 0)}/{event.get('task_count', 0)})",
+                f"({event.get('completed_count', 0)}/{event.get('task_count', 0)}"
+                f" · сумарно {total:.1f} с)",
                 color=color,
             )
+        elif event_type == "task_exhausted":
+            self._append_session_log(session, f"{prefix}: ✖ {message}", color=color)
         elif event_type in {
             "work_review_started",
             "work_review_finished",
@@ -1631,9 +1988,31 @@ class MainWindow(QMainWindow):
             session.stop_requested = False
         elif message:
             self._append_session_log(session, message)
-        self._refresh_workspace_sidebar()
-        if session.id == self.current_workspace_id:
-            self._update_workspace_actions()
+        if event_type in {
+            "node_finished",
+            "node_failed",
+            "node_cancelled",
+            "run_finished",
+            "run_failed",
+            "run_cancelled",
+        } and session.id == self.current_workspace_id:
+            self.log_panel.set_activity("", "")
+        if event_type in {
+            "node_finished",
+            "node_failed",
+            "node_cancelled",
+            "work_review_finished",
+            "work_review_failed",
+            "run_finished",
+            "run_failed",
+            "run_cancelled",
+        }:
+            session.active_file_node_id = ""
+            session.active_file_iteration = 0
+        if event_type in WORKSPACE_UI_EVENT_TYPES:
+            self._refresh_workspace_sidebar()
+            if session.id == self.current_workspace_id:
+                self._update_workspace_actions()
 
     @staticmethod
     def _update_node_runtime(
@@ -1680,6 +2059,13 @@ class MainWindow(QMainWindow):
             session.checkpoint = outputs
         if session.run_state == "needs_attention":
             session.stop_requested = False
+            if session.run_directory is not None and session.checkpoint is not None:
+                save_checkpoint(
+                    session.run_directory,
+                    session.checkpoint,
+                    project_path=session.project_path,
+                    request=session.pending_intervention or {},
+                )
             self._save_run_log_for_session(session, "needs_attention")
             self._refresh_workspace_sidebar()
             return
@@ -1697,11 +2083,27 @@ class MainWindow(QMainWindow):
             session.run_state = "failed"
             status, message = "failed", "■ Flow завершився помилкою"
         else:
-            session.run_state = "completed"
+            failed_tasks = [
+                state
+                for states in session.task_states.values()
+                for state in states
+                if state.get("status") == "failed"
+            ]
+            if failed_tasks:
+                session.run_state = "completed_with_failures"
+                status = "completed_with_failures"
+                message = f"■ Виконано, провалено завдань: {len(failed_tasks)}"
+            else:
+                session.run_state = "completed"
+                status, message = "success", "■ Виконання завершено"
             session.unread_result = session.id != self.current_workspace_id
-            status, message = "success", "■ Виконання завершено"
         self._append_session_log(session, message)
+        if session.id == self.current_workspace_id:
+            self.scene.set_active_edge("")
+            self.log_panel.set_activity("", "")
         session.stop_requested = False
+        if session.run_directory is not None:
+            clear_checkpoint(session.run_directory)
         log_path = self._save_run_log_for_session(session, status)
         LOGGER.info(
             "Workflow finished session=%s status=%s log=%s",
@@ -1713,12 +2115,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"{message.removeprefix('■ ')}. Журнал: {log_path}", 9000
             )
-        if status in {"success", "failed"}:
+        if status in {"success", "failed", "completed_with_failures"}:
             self._notify_user(
                 session,
                 "FlowAI: виконання завершено",
                 f"{session.display_name}: {message.removeprefix('■ ')}",
-                warning=status == "failed",
+                warning=status in {"failed", "completed_with_failures"},
             )
         self._refresh_workspace_sidebar()
 
@@ -1729,7 +2131,14 @@ class MainWindow(QMainWindow):
             return
         self._finalize_running_runtimes(session)
         session.run_state = "failed"
+        session.active_file_node_id = ""
+        session.active_file_iteration = 0
+        if session.id == self.current_workspace_id:
+            self.scene.set_active_edge("")
+            self.log_panel.set_activity("", "")
         session.stop_requested = False
+        if session.run_directory is not None:
+            clear_checkpoint(session.run_directory)
         self._append_session_log(session, f"Критична помилка: {message}")
         self._save_run_log_for_session(session, "failed", message)
         LOGGER.error("Workflow failed session=%s: %s", session_id, message)
@@ -1747,8 +2156,13 @@ class MainWindow(QMainWindow):
         session = self._workspace(session_id)
         if session is None:
             return
+        if session.file_watcher is not None:
+            session.file_watcher.stop()
+            session.file_watcher = None
         session.run_thread = None
         session.run_worker = None
+        session.active_file_node_id = ""
+        session.active_file_iteration = 0
         session.stop_requested = False
         self._update_workspace_actions()
         self._refresh_workspace_sidebar()
@@ -1756,13 +2170,26 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.refresh_account)
         if session.run_state == "needs_attention" and session.pending_intervention:
             request = session.pending_intervention
-            self._notify_user(
-                session,
-                "FlowAI очікує на підтвердження",
-                f"{session.display_name}: {request.get('question', 'Потрібна відповідь')}",
-                node_id=str(request.get("node_id") or ""),
-                warning=True,
-            )
+            if request.get("type") == "calibration":
+                report = request.get("report") or {}
+                task = str(report.get("task_title") or "завдання")
+                self._notify_user(
+                    session,
+                    "FlowAI: рев'ювер відхилив роботу",
+                    f"{session.display_name}: «{task}» повернуто на переробку",
+                    node_id=str(request.get("node_id") or ""),
+                    warning=True,
+                    actions=[ToastAction("edits", "Показати правки")],
+                )
+            else:
+                self._notify_user(
+                    session,
+                    "FlowAI очікує на підтвердження",
+                    f"{session.display_name}: "
+                    f"{request.get('question', 'Потрібна відповідь')}",
+                    node_id=str(request.get("node_id") or ""),
+                    warning=True,
+                )
         if (
             session.id == self.current_workspace_id
             and session.run_state == "needs_attention"
@@ -1932,6 +2359,7 @@ class MainWindow(QMainWindow):
         self.current_workspace_id = session.id
         if session.history_state is None:
             self._initialize_workspace_history(session, saved=not session.dirty)
+        had_unread_result = session.unread_result
         session.unread_result = False
         self.project_path = session.project_path
         self.dirty = session.dirty
@@ -1984,6 +2412,12 @@ class MainWindow(QMainWindow):
             and session.pending_intervention.get("type") != "result_confirmation"
         ):
             QTimer.singleShot(0, self._show_pending_intervention)
+        if had_unread_result and session.run_state in {
+            "completed",
+            "completed_with_failures",
+            "failed",
+        }:
+            QTimer.singleShot(0, self.show_run_results)
 
     def _capture_current_workspace(self) -> None:
         session = self.current_workspace
@@ -1993,7 +2427,6 @@ class MainWindow(QMainWindow):
         session.workflow = self.scene.workflow
         session.project_path = self.project_path
         session.dirty = self.dirty
-        session.log_text = self.log_view.toPlainText()
         session.node_statuses = self.scene.node_statuses()
         session.canvas_transform = self.view.transform()
         session.horizontal_scroll = self.view.horizontalScrollBar().value()
@@ -2035,6 +2468,7 @@ class MainWindow(QMainWindow):
             session.dirty = False
         self._initialize_workspace_history(session, saved=not session.dirty)
         session.run_state = "idle"
+        self._restore_pending_run(session)
         self._persist_workspace_registry()
         return True
 
@@ -2046,7 +2480,8 @@ class MainWindow(QMainWindow):
         self.current_run_events = []
         self.scene.set_workflow(Workflow())
         self.inspector.set_workflow(None)
-        self.log_view.clear()
+        self.log_panel.clear()
+        self.log_panel.set_activity("", "")
         self.inspector.set_object(None)
         self.central_stack.setCurrentWidget(self.empty_workspace_page)
         self._update_title()
@@ -2066,7 +2501,7 @@ class MainWindow(QMainWindow):
         for entry in entries:
             if not isinstance(entry, dict) or not entry.get("path"):
                 continue
-            path = Path(str(entry["path"]))
+            path = relocated_project_path(Path(str(entry["path"])))
             key = str(path).casefold()
             if key in seen:
                 continue
@@ -2297,6 +2732,123 @@ class MainWindow(QMainWindow):
         self._persist_workspace_registry()
         self._refresh_workspace_sidebar()
 
+    def _show_calibration(
+        self, session: WorkspaceSession, request: dict[str, Any]
+    ) -> None:
+        """Показати причину відхилення та запропоновані правки."""
+        workflow = session.workflow
+        if workflow is None:
+            return
+        report = CalibrationReport.from_dict(request.get("report") or {})
+        node_id = str(request.get("node_id") or "")
+        executor = next(iter(workflow.nodes_of_kind("executor")), None)
+        dialog = CalibrationDialog(
+            report,
+            self,
+            models=self.calibration_models,
+            default_model=str(
+                executor.config.get("model", "gpt-5.6-terra")
+                if executor
+                else "gpt-5.6-terra"
+            ),
+            default_effort=str(
+                executor.config.get("reasoning_effort", "medium")
+                if executor
+                else "medium"
+            ),
+        )
+        dialog.tabs.setCurrentIndex(self.calibration_open_tab)
+        self.calibration_open_tab = 0
+        self.intervention_dialog_open = True
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self.intervention_dialog_open = False
+
+        directory = session.run_directory
+        if directory is not None:
+            save_report(dialog.report, directory)
+
+        if not accepted or dialog.decision == "stop":
+            session.run_state = "cancelled"
+            session.pending_intervention = None
+            if node_id:
+                self.scene.set_attention(node_id, False)
+            self._append_session_log(session, "■ Flow зупинено користувачем")
+            self._save_run_log_for_session(session, "cancelled")
+            if directory is not None:
+                clear_checkpoint(directory)
+            self._refresh_workspace_sidebar()
+            return
+
+        if dialog.decision in {"apply", "regenerate"}:
+            results = apply_edits(dialog.report, workflow)
+            for item in results:
+                marker = "✔" if item.ok else "✖"
+                self._append_session_log(
+                    session, f"{marker} {item.edit.label}: {item.message}"
+                )
+            if dialog.pinned_skills and executor is not None:
+                pinned = pin_skills(
+                    workflow,
+                    executor.id,
+                    dialog.pinned_skills,
+                    skills_root=SKILLS_ROOT,
+                )
+                if pinned:
+                    self._append_session_log(
+                        session, "Закріплено скіли: " + ", ".join(pinned)
+                    )
+            session.dirty = True
+            self._mark_dirty()
+
+        if dialog.decision == "regenerate":
+            self._start_regeneration(session, dialog)
+            return
+
+        action = "retry_task" if dialog.decision == "apply" else "continue"
+        session.intervention_responses[node_id] = {"action": action}
+        session.pending_intervention = None
+        session.run_state = "idle"
+        if node_id:
+            self.scene.set_attention(node_id, False)
+        self._refresh_workspace_sidebar()
+        self.run_workflow(resume=True)
+
+    def _start_regeneration(
+        self, session: WorkspaceSession, dialog: CalibrationDialog
+    ) -> None:
+        """Перезібрати промпт з AI, спираючись на звіт калібрації."""
+        workflow = session.workflow
+        if workflow is None:
+            return
+        generated = [
+            str(path)
+            for group in session.generated_file_groups
+            for path in list(group.get("intermediate", []))
+            + list(group.get("result", []))
+        ]
+        grill = GrillDialog(
+            workflow,
+            dialog.model,
+            workflow.resolved_workspace(session.project_path),
+            self,
+            reasoning_effort=dialog.effort,
+            calibration=dialog.report,
+            generated_files=list(dict.fromkeys(generated)),
+        )
+        accepted = grill.exec() == QDialog.DialogCode.Accepted
+        if accepted and grill.outcome is not None:
+            self._apply_grill_outcome(session, grill.outcome)
+        node_id = str(dialog.report.node_id)
+        session.intervention_responses[node_id] = {"action": "retry_task"}
+        session.pending_intervention = None
+        session.run_state = "idle"
+        if node_id:
+            self.scene.set_attention(node_id, False)
+        self._refresh_workspace_sidebar()
+        self.run_workflow(resume=True)
+
     def _show_pending_intervention(self, user_initiated: bool = False) -> None:
         session = self.current_workspace
         if (
@@ -2308,6 +2860,9 @@ class MainWindow(QMainWindow):
         ):
             return
         request = session.pending_intervention
+        if request.get("type") == "calibration":
+            self._show_calibration(session, request)
+            return
         node_id = str(request.get("node_id") or "")
         limit_request = request.get("type") == "result_limit"
         confirmation_request = request.get("type") == "result_confirmation"
@@ -2333,6 +2888,8 @@ class MainWindow(QMainWindow):
             # Користувач вибрав «Зупинити Flow».
             session.run_state = "cancelled"
             session.pending_intervention = None
+            if session.run_directory is not None:
+                clear_checkpoint(session.run_directory)
             if node_id:
                 self.scene.set_attention(node_id, False)
             self._append_session_log(session, "■ Flow зупинено користувачем")
@@ -2349,6 +2906,29 @@ class MainWindow(QMainWindow):
         self.scene.set_attention(node_id, False)
         self._refresh_workspace_sidebar()
         self.run_workflow(resume=True)
+
+    def _restore_pending_run(self, session: WorkspaceSession) -> None:
+        """Підняти призупинений запуск після перезапуску FlowAI."""
+        if session.project_path is None or session.checkpoint is not None:
+            return
+        directory = find_pending_run(session.project_path)
+        if directory is None:
+            return
+        restored = load_checkpoint(directory)
+        if restored is None:
+            return
+        checkpoint, request = restored
+        session.checkpoint = checkpoint
+        session.run_directory = directory
+        session.pending_intervention = request or None
+        session.run_state = "needs_attention"
+        node_id = str(request.get("node_id") or "")
+        if node_id and session.id == self.current_workspace_id:
+            self.scene.set_attention(node_id, True)
+        self._append_session_log(
+            session, f"■ Відновлено призупинений запуск: {directory}"
+        )
+        self._refresh_workspace_sidebar()
 
     @staticmethod
     def _workflow_snapshot(workflow: Workflow) -> dict[str, Any]:
@@ -2477,6 +3057,9 @@ class MainWindow(QMainWindow):
                 {
                     "true_limit": int(model.config.get("true_limit", 1)),
                     "false_limit": int(model.config.get("false_limit", 3)),
+                    "task_attempt_limit": int(
+                        model.config.get("task_attempt_limit", 2)
+                    ),
                     "wait_for_confirmation": bool(
                         model.config.get("wait_for_confirmation", False)
                     ),
@@ -2515,11 +3098,13 @@ class MainWindow(QMainWindow):
         waiting = bool(session and session.run_state == "needs_attention")
         self.save_action.setEnabled(loaded)
         self.settings_action.setEnabled(loaded and not running)
+        self.edit_flow_action.setEnabled(loaded and not running and not waiting)
         self.run_action.setEnabled(loaded and not running and not waiting)
         self.stop_action.setEnabled(
             loaded and running and bool(session and not session.stop_requested)
         )
         self.files_action.setEnabled(loaded)
+        self.stats_action.setEnabled(bool(loaded and session and session.run_events))
         self.inspector.setEnabled(loaded)
         self.inspector.set_execution_locked(running)
         for button in self.node_buttons:
@@ -2557,11 +3142,53 @@ class MainWindow(QMainWindow):
             )
 
     def _clear_current_log(self) -> None:
-        self.log_view.clear()
+        self.log_panel.clear()
         session = self.current_workspace
         if session is not None:
             session.log_text = ""
             session.log_entries.clear()
+
+    def _intermediate_file(self, session_id: str, path: str) -> None:
+        session = self._workspace(session_id)
+        if (
+            session is None
+            or session.workflow is None
+            or not session.active_file_node_id
+        ):
+            return
+        node = session.workflow.find(session.active_file_node_id)
+        if node is None:
+            return
+        iteration = max(1, session.active_file_iteration)
+        group = next(
+            (
+                candidate
+                for candidate in reversed(session.generated_file_groups)
+                if str(candidate.get("node_id") or "") == node.id
+                and int(candidate.get("iteration", 1)) == iteration
+            ),
+            None,
+        )
+        if group is None:
+            group = {
+                "node_id": node.id,
+                "node_title": node.title,
+                "iteration": iteration,
+                "color": NODE_COLORS.get(node.kind, "#CBD5E1"),
+                "intermediate": [],
+                "result": [],
+            }
+            session.generated_file_groups.append(group)
+        intermediate = group.setdefault("intermediate", [])
+        if path in intermediate:
+            return
+        intermediate.append(path)
+        self._append_session_log(
+            session,
+            f"Проміжний файл: {path}",
+            color=str(group.get("color") or ""),
+            file_paths=[path],
+        )
 
     def _append_session_log(
         self,
@@ -2600,44 +3227,10 @@ class MainWindow(QMainWindow):
             if trimmed:
                 self._render_session_log(session)
             else:
-                self._insert_log_entry(log_entry)
+                self.log_panel.append_entry(log_entry)
 
     def _render_session_log(self, session: WorkspaceSession) -> None:
-        self.log_view.clear()
-        if not session.log_entries:
-            self.log_view.setPlainText(session.log_text)
-            self.log_view.moveCursor(QTextCursor.MoveOperation.End)
-            return
-        for entry in session.log_entries:
-            self._insert_log_entry(entry)
-
-    def _insert_log_entry(self, entry: dict[str, Any]) -> None:
-        timestamp = str(entry.get("timestamp", ""))
-        text = str(entry.get("text", ""))
-        full_text = f"[{timestamp}] {text}\n"
-        cursor = QTextCursor(self.log_view.document())
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        start = cursor.position()
-        base = QTextCharFormat()
-        base.setForeground(QColor(str(entry.get("color") or "#CBD5E1")))
-        cursor.insertText(full_text, base)
-
-        file_format = QTextCharFormat(base)
-        file_format.setFontUnderline(True)
-        file_format.setForeground(QColor("#93C5FD"))
-        for path in entry.get("file_paths", []):
-            needle = str(path)
-            offset = full_text.find(needle)
-            while needle and offset >= 0:
-                highlight = QTextCursor(self.log_view.document())
-                highlight.setPosition(start + offset)
-                highlight.setPosition(
-                    start + offset + len(needle),
-                    QTextCursor.MoveMode.KeepAnchor,
-                )
-                highlight.mergeCharFormat(file_format)
-                offset = full_text.find(needle, offset + len(needle))
-        self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+        self.log_panel.render_entries(session.log_entries)
 
     @staticmethod
     def _node_color(session: WorkspaceSession, node_id: str) -> str:
@@ -2757,17 +3350,52 @@ class MainWindow(QMainWindow):
             for group in session.generated_file_groups
             if str(group.get("node_id") or "") == node_id
         )
-        iteration = max(1, int(event.get("iteration") or previous_passes + 1))
-        session.generated_file_groups.append(
-            {
-                "node_id": node_id,
-                "node_title": node.title,
-                "iteration": iteration,
-                "color": NODE_COLORS.get(node.kind, "#CBD5E1"),
-                "intermediate": intermediate,
-                "result": final_files,
-            }
+        iteration = max(
+            1,
+            int(
+                event.get("iteration")
+                or (
+                    session.active_file_iteration
+                    if session.active_file_node_id == node_id
+                    else 0
+                )
+                or previous_passes + 1
+            ),
         )
+        existing = next(
+            (
+                group
+                for group in reversed(session.generated_file_groups)
+                if str(group.get("node_id") or "") == node_id
+                and int(group.get("iteration", 1)) == iteration
+            ),
+            None,
+        )
+        if existing is None:
+            session.generated_file_groups.append(
+                {
+                    "node_id": node_id,
+                    "node_title": node.title,
+                    "iteration": iteration,
+                    "color": NODE_COLORS.get(node.kind, "#CBD5E1"),
+                    "intermediate": intermediate,
+                    "result": final_files,
+                }
+            )
+            return
+        existing_intermediate = [
+            str(path) for path in existing.get("intermediate", []) if str(path)
+        ]
+        existing_result = [
+            str(path) for path in existing.get("result", []) if str(path)
+        ]
+        merged_result = list(dict.fromkeys([*existing_result, *final_files]))
+        existing["intermediate"] = [
+            path
+            for path in dict.fromkeys([*existing_intermediate, *intermediate])
+            if path not in merged_result
+        ]
+        existing["result"] = merged_result
 
     @staticmethod
     def _log_preview(value: object, limit: int = MAX_NODE_RESULT_PREVIEW) -> str:
@@ -2834,18 +3462,6 @@ class MainWindow(QMainWindow):
                 f"Папка логів: {directory}",
             )
 
-    def showEvent(self, event: Any) -> None:
-        super().showEvent(event)
-        if sys.platform != "win32" or self._wts_notifications_registered:
-            return
-        try:
-            result = ctypes.windll.wtsapi32.WTSRegisterSessionNotification(
-                ctypes.wintypes.HWND(int(self.winId())), 0
-            )
-            self._wts_notifications_registered = bool(result)
-        except (AttributeError, OSError):
-            LOGGER.warning("Could not register Windows session notifications")
-
     def nativeEvent(self, event_type: Any, message: Any) -> tuple[bool, int]:
         if sys.platform == "win32":
             try:
@@ -2855,11 +3471,6 @@ class MainWindow(QMainWindow):
                         self._set_system_pause_reason("sleep", True)
                     elif native.wParam in {0x0007, 0x0012}:  # resume variants
                         self._set_system_pause_reason("sleep", False)
-                elif native.message == 0x02B1:  # WM_WTSSESSION_CHANGE
-                    if native.wParam == 0x0007:  # WTS_SESSION_LOCK
-                        self._set_system_pause_reason("lock", True)
-                    elif native.wParam == 0x0008:  # WTS_SESSION_UNLOCK
-                        self._set_system_pause_reason("lock", False)
             except (TypeError, ValueError, OSError):
                 LOGGER.debug("Could not decode native Windows event", exc_info=True)
         return super().nativeEvent(event_type, message)
@@ -2875,14 +3486,14 @@ class MainWindow(QMainWindow):
             return
 
         if is_paused:
-            message = "ПК переходить у сон або заблокований — Flow очікує"
+            message = "ПК переходить у сон — Flow продовжиться після пробудження"
             for session in self.workspace_sessions:
                 if session.run_worker is None or session.run_state != "running":
                     continue
                 session.run_worker.pause(message)
                 session.run_state = "paused"
         else:
-            message = "ПК активний — виконання Flow відновлено"
+            message = "ПК прокинувся — виконання Flow триває"
             for session in self.workspace_sessions:
                 if session.run_worker is None or session.run_state != "paused":
                     continue
@@ -2932,13 +3543,6 @@ class MainWindow(QMainWindow):
         self._capture_current_workspace()
         self._persist_workspace_registry()
         self._persist_layout()
-        if self._wts_notifications_registered and sys.platform == "win32":
-            try:
-                ctypes.windll.wtsapi32.WTSUnRegisterSessionNotification(
-                    ctypes.wintypes.HWND(int(self.winId()))
-                )
-            except (AttributeError, OSError):
-                LOGGER.warning("Could not unregister Windows session notifications")
         self.tray_icon.hide()
         if self.account_thread is not None:
             self.account_thread.quit()

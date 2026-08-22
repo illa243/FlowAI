@@ -40,6 +40,7 @@ class WorkReviewProtocol:
         self.started_at = datetime.now().astimezone()
         self.finished_at: datetime | None = None
         self.status = "running"
+        self.failed_tasks: list[str] = []
         self._headers: dict[str, str] = {}
         self._sections: dict[str, list[str]] = {}
         self._order: list[str] = []
@@ -136,8 +137,9 @@ class WorkReviewProtocol:
         """Записи протоколу для збереження в чекпоінті запуску."""
         return {node_id: list(items) for node_id, items in self._sections.items()}
 
-    def finish(self, status: str) -> Path:
+    def finish(self, status: str, failed_tasks: list[str] | None = None) -> Path:
         self.status = status
+        self.failed_tasks = list(failed_tasks or [])
         self.finished_at = datetime.now().astimezone()
         self._write()
         return self.path
@@ -186,6 +188,14 @@ class WorkReviewProtocol:
             for record in records:
                 body.append(record)
                 body.append("")
+
+        if self.failed_tasks:
+            body.extend(["## Провалені завдання", ""])
+            body.extend(
+                f"- {title} — вичерпано ліміт спроб"
+                for title in self.failed_tasks
+            )
+            body.append("")
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("\n".join(head + body).rstrip() + "\n", encoding="utf-8")

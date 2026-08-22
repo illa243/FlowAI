@@ -15,10 +15,12 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -38,7 +40,9 @@ from ..models import (
     managed_task_title,
     normalize_managed_tasks,
 )
+from ..skills import list_skills
 from .attachments import AttachmentListWidget
+from .motion import AnimatedDialog
 
 AGENT_FIELDS = {
     "model",
@@ -53,6 +57,7 @@ AGENT_FIELDS = {
     "output_format",
     "output_schema",
     "attachments",
+    "skills",
     "retries",
 }
 
@@ -63,11 +68,13 @@ KIND_FIELDS: dict[str, set[str]] = {
     "executor": set(AGENT_FIELDS),
     "task_reviewer": AGENT_FIELDS | {"criteria_node"},
     "work_reviewer": AGENT_FIELDS | {"monitor_all", "monitored_nodes", "report_path"},
+    "calibrator": AGENT_FIELDS | {"false_threshold", "threshold_hint"},
     "result": {
         "template",
         "save_path",
         "true_limit",
         "false_limit",
+        "task_attempt_limit",
         "wait_for_confirmation",
     },
 }
@@ -91,7 +98,98 @@ class NoWheelSpinBox(QSpinBox):
         event.ignore()
 
 
-class FullScreenTextEditorDialog(QDialog):
+class ExplicitVisibilityLabel(QLabel):
+    """Віддавати явний стан show/hide ще до показу батьківського вікна."""
+
+    def isVisible(self) -> bool:
+        return not self.isHidden()
+
+
+class SkillPinWidget(QWidget):
+    """Скіли, які Codex завантажить для ноди до першого кроку."""
+
+    skills_changed = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._values: list[dict[str, str]] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.list = QListWidget()
+        self.list.setMaximumHeight(96)
+        layout.addWidget(self.list)
+        buttons = QHBoxLayout()
+        add = QPushButton("Закріпити скіл")
+        remove = QPushButton("Прибрати")
+        add.clicked.connect(self._choose)
+        remove.clicked.connect(self._remove)
+        buttons.addWidget(add)
+        buttons.addWidget(remove)
+        layout.addLayout(buttons)
+
+    def set_skills(self, values: list[dict[str, str]]) -> None:
+        self._values = [
+            {
+                "name": str(item.get("name", "")),
+                "path": str(item.get("path", "")),
+            }
+            for item in values
+            if isinstance(item, dict) and str(item.get("name", ""))
+        ]
+        self._render()
+
+    def skills(self) -> list[dict[str, str]]:
+        return [dict(item) for item in self._values]
+
+    def add_skill(self, name: str, path: str) -> None:
+        """Закріпити скіл один раз, ідентифікуючи його за іменем."""
+        if not name or any(item["name"] == name for item in self._values):
+            return
+        self._values.append({"name": name, "path": path})
+        self._render()
+        self.skills_changed.emit()
+
+    def _render(self) -> None:
+        self.list.clear()
+        for item in self._values:
+            row = QListWidgetItem(item["name"])
+            row.setToolTip(item["path"])
+            self.list.addItem(row)
+
+    def _choose(self) -> None:
+        entries = [entry for entry in list_skills(None) if entry.enabled]
+        if not entries:
+            QMessageBox.information(
+                self,
+                "Скілів не знайдено",
+                "У ~/.codex/skills немає жодного скіла.",
+            )
+            return
+        names = [f"{entry.name} — {entry.description[:70]}" for entry in entries]
+        choice, accepted = QInputDialog.getItem(
+            self,
+            "Закріпити скіл",
+            "Який скіл має завантажити агент?",
+            names,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        entry = entries[names.index(choice)]
+        self.add_skill(entry.name, str(entry.path))
+
+    def _remove(self) -> None:
+        row = self.list.currentRow()
+        if row < 0:
+            return
+        self._values.pop(row)
+        self._render()
+        self.skills_changed.emit()
+
+
+class FullScreenTextEditorDialog(AnimatedDialog):
     """Maximized editor used by large text fields in Parameters."""
 
     def __init__(
@@ -193,6 +291,7 @@ class ManagedTaskEditor(QFrame):
         super().__init__()
         self.task_id = str(task.get("id") or uuid4().hex)
         self.index = index
+        self._loading = False
         self.setObjectName("managedTaskEditor")
 
         self.heading = QLabel()
@@ -243,6 +342,26 @@ class ManagedTaskEditor(QFrame):
             "attachments": self.attachments.paths(),
         }
 
+    def set_task(self, task: dict[str, Any]) -> None:
+        """Наповнити наявний редактор новим завданням.
+
+        Створення редактора коштує дорого: у ноді з вісьмома завданнями
+        повна перебудова блокує UI-потік на десятки, а на холодному старті —
+        на сотні мілісекунд. Саме через це канвас підвисав одразу після
+        вибору Tasks Manager.
+        """
+        self._loading = True
+        try:
+            self.task_id = str(task.get("id") or uuid4().hex)
+            prompt = str(task.get("prompt", ""))
+            if self.prompt.toPlainText() != prompt:
+                self.prompt.setPlainText(prompt)
+            paths = [str(path) for path in task.get("attachments", []) if str(path)]
+            if self.attachments.paths() != paths:
+                self.attachments.set_paths(paths)
+        finally:
+            self._loading = False
+
     def refresh_heading(self, index: int) -> None:
         self.index = index
         self.prompt.field_title = f"Промпт завдання {index + 1}"
@@ -253,6 +372,8 @@ class ManagedTaskEditor(QFrame):
         self.heading.setText(f"{index + 1}. {managed_task_title(self.value(), index)}")
 
     def _content_changed(self) -> None:
+        if self._loading:
+            return
         self.refresh_heading(self.index)
         self.changed.emit()
 
@@ -287,15 +408,25 @@ class ManagedTasksWidget(QWidget):
         self.set_tasks([])
 
     def set_tasks(self, tasks: Any) -> None:
+        """Показати завдання, перевикористовуючи вже створені редактори.
+
+        Раніше кожен виклик знищував і будував наново всі секції, тож вибір
+        ноди Tasks Manager підвішував інтерфейс. Тепер створюються лише ті
+        редактори, яких бракує, а зайві прибираються.
+        """
         self.loading = True
         try:
-            for section in self.sections:
+            wanted = normalize_managed_tasks(tasks)
+            while len(self.sections) > len(wanted):
+                section = self.sections.pop()
                 self.sections_layout.removeWidget(section)
                 section.setParent(None)
                 section.deleteLater()
-            self.sections.clear()
-            for task in normalize_managed_tasks(tasks):
-                self._append_section(task)
+            for index, task in enumerate(wanted):
+                if index < len(self.sections):
+                    self.sections[index].set_task(task)
+                else:
+                    self._append_section(task)
             self._refresh_sections()
         finally:
             self.loading = False
@@ -382,6 +513,10 @@ class Inspector(QWidget):
 
     def set_workflow(self, workflow: Workflow | None) -> None:
         self.workflow = workflow
+
+    def focus_first_task(self) -> None:
+        if self.tasks_editor.sections:
+            self.tasks_editor.sections[0].prompt.setFocus()
 
     def _build_empty_page(self) -> QWidget:
         return QWidget()
@@ -481,6 +616,9 @@ class Inspector(QWidget):
         )
         self.node_form.addRow("Файли і картинки", attachment_controls)
 
+        self.skill_pins = SkillPinWidget()
+        self.node_form.addRow("Скіли", self.skill_pins)
+
         self.retries_spin = NoWheelSpinBox()
         self.retries_spin.setRange(0, 5)
         self.node_form.addRow("Повторні спроби", self.retries_spin)
@@ -508,6 +646,27 @@ class Inspector(QWidget):
         self.false_limit = NoWheelSpinBox()
         self.false_limit.setRange(1, 99)
         self.node_form.addRow("Ліміт проходів FALSE", self.false_limit)
+        self.task_attempt_limit = NoWheelSpinBox()
+        self.task_attempt_limit.setRange(1, 99)
+        self.task_attempt_limit.setToolTip(
+            "Скільки разів одне завдання Tasks Manager може піти на переробку, "
+            "перш ніж спрацює жовтий вихід EXHAUSTED"
+        )
+        self.node_form.addRow("Ліміт спроб на завдання", self.task_attempt_limit)
+
+        self.false_threshold = NoWheelSpinBox()
+        self.false_threshold.setRange(1, 20)
+        self.false_threshold.setValue(1)
+        self.false_threshold.setToolTip(
+            "Після якого за рахунком FALSE зупиняти Flow і показувати "
+            "рекомендації"
+        )
+        self.node_form.addRow("Зупиняти після FALSE №", self.false_threshold)
+
+        self.threshold_hint = ExplicitVisibilityLabel("")
+        self.threshold_hint.setObjectName("mutedLabel")
+        self.threshold_hint.setWordWrap(True)
+        self.node_form.addRow("", self.threshold_hint)
 
         self.wait_for_confirmation = QCheckBox(
             "Очікувати підтвердження перед переходом"
@@ -540,12 +699,16 @@ class Inspector(QWidget):
             "output_format": self.output_format,
             "output_schema": self.output_schema,
             "attachments": attachment_controls,
+            "skills": self.skill_pins,
             "retries": self.retries_spin,
             "criteria_node": self.criteria_combo,
             "template": self.template_edit,
             "save_path": save_box,
             "true_limit": self.true_limit,
             "false_limit": self.false_limit,
+            "task_attempt_limit": self.task_attempt_limit,
+            "false_threshold": self.false_threshold,
+            "threshold_hint": self.threshold_hint,
             "wait_for_confirmation": self.wait_for_confirmation,
             "monitor_all": self.monitor_all,
             "monitored_nodes": self.monitored_nodes,
@@ -575,8 +738,11 @@ class Inspector(QWidget):
         self.save_path.textEdited.connect(self._save_node)
         self.true_limit.valueChanged.connect(self._save_node)
         self.false_limit.valueChanged.connect(self._save_node)
+        self.task_attempt_limit.valueChanged.connect(self._save_node)
+        self.false_threshold.valueChanged.connect(self._save_node)
         self.wait_for_confirmation.toggled.connect(self._save_node)
         self.attachments.paths_changed.connect(self._save_node)
+        self.skill_pins.skills_changed.connect(self._save_node)
         self.monitor_all.toggled.connect(self._monitor_all_toggled)
         self.monitored_nodes.itemChanged.connect(self._save_node)
         self.report_path.textEdited.connect(self._save_node)
@@ -702,6 +868,7 @@ class Inspector(QWidget):
             if self.current.kind == "result":
                 self.true_limit.setEnabled(True)
                 self.false_limit.setEnabled(True)
+                self.task_attempt_limit.setEnabled(True)
                 self.wait_for_confirmation.setEnabled(True)
         elif editable:
             self._update_prompt_field_state()
@@ -771,6 +938,7 @@ class Inspector(QWidget):
         self.attachments.set_paths(
             [str(item) for item in node.config.get("attachments", [])]
         )
+        self.skill_pins.set_skills(node.config.get("skills", []))
         self.retries_spin.setValue(int(node.config.get("retries", 0)))
 
         self.criteria_combo.clear()
@@ -785,6 +953,9 @@ class Inspector(QWidget):
         self.save_path.setText(str(node.config.get("save_path", "")))
         self.true_limit.setValue(int(node.config.get("true_limit", 1)))
         self.false_limit.setValue(int(node.config.get("false_limit", 3)))
+        self.task_attempt_limit.setValue(
+            int(node.config.get("task_attempt_limit", 2))
+        )
         self.wait_for_confirmation.setChecked(
             bool(node.config.get("wait_for_confirmation", False))
         )
@@ -808,7 +979,11 @@ class Inspector(QWidget):
         self.monitored_nodes.setEnabled(not watch_all)
         self.report_path.setText(str(node.config.get("report_path", "")))
 
+        self.false_threshold.setValue(
+            max(1, int(node.config.get("false_threshold", 1)))
+        )
         self._show_node_fields(node.kind)
+        self._update_threshold_hint(node)
         self._update_prompt_field_state()
 
     def _show_node_fields(self, kind: str) -> None:
@@ -841,6 +1016,7 @@ class Inspector(QWidget):
                 return
             node.config["true_limit"] = self.true_limit.value()
             node.config["false_limit"] = self.false_limit.value()
+            node.config["task_attempt_limit"] = self.task_attempt_limit.value()
             node.config["wait_for_confirmation"] = (
                 self.wait_for_confirmation.isChecked()
             )
@@ -861,6 +1037,7 @@ class Inspector(QWidget):
             node.config["save_path"] = self.save_path.text().strip()
             node.config["true_limit"] = self.true_limit.value()
             node.config["false_limit"] = self.false_limit.value()
+            node.config["task_attempt_limit"] = self.task_attempt_limit.value()
             node.config["wait_for_confirmation"] = (
                 self.wait_for_confirmation.isChecked()
             )
@@ -880,6 +1057,7 @@ class Inspector(QWidget):
                     "output_format": self.output_format.currentData(),
                     "retries": self.retries_spin.value(),
                     "attachments": self._list_values(self.attachments),
+                    "skills": self.skill_pins.skills(),
                 }
             )
             schema = self._parse_json(self.output_schema)
@@ -893,8 +1071,34 @@ class Inspector(QWidget):
                     self.monitored_nodes
                 )
                 node.config["report_path"] = self.report_path.text().strip()
+            elif node.kind == "calibrator":
+                node.config["false_threshold"] = self.false_threshold.value()
+                self._update_threshold_hint(node)
 
         self.changed.emit(node)
+
+    def _update_threshold_hint(self, node: FlowNode) -> None:
+        """Попередити, що за цього порога EXHAUSTED не спрацює."""
+        self.threshold_hint.clear()
+        if node.kind != "calibrator" or self.workflow is None:
+            self.threshold_hint.setVisible(False)
+            return
+        threshold = max(1, int(node.config.get("false_threshold", 1)))
+        limits = [
+            max(1, int(source.config.get("task_attempt_limit", 2)))
+            for edge in self.workflow.incoming(node.id)
+            if (source := self.workflow.find(edge.source)) is not None
+            and source.kind == "result"
+        ]
+        if limits and threshold <= min(limits):
+            self.threshold_hint.setText(
+                f"Поріг {threshold} спрацює раніше за ліміт спроб "
+                f"{min(limits)} — вихід EXHAUSTED і червоний хрестик "
+                "лишаться запобіжником і в цьому Flow не задіються."
+            )
+            self.threshold_hint.setVisible(True)
+        else:
+            self.threshold_hint.setVisible(False)
 
     def _save_edge(self, *args: Any) -> None:
         if (
@@ -933,10 +1137,14 @@ class Inspector(QWidget):
         try:
             parsed = json.loads(editor.toPlainText() or "{}")
         except json.JSONDecodeError as exc:
-            editor.setStyleSheet("border-color: #EF4444;")
+            editor.setProperty("invalid", True)
+            editor.style().unpolish(editor)
+            editor.style().polish(editor)
             editor.setToolTip(str(exc))
             return None
-        editor.setStyleSheet("")
+        editor.setProperty("invalid", False)
+        editor.style().unpolish(editor)
+        editor.style().polish(editor)
         editor.setToolTip("")
         return parsed
 
@@ -948,12 +1156,14 @@ class Inspector(QWidget):
 
     def _monitor_all_toggled(self, checked: bool) -> None:
         self.monitored_nodes.setEnabled(not checked)
+        was_loading = self.loading
         if checked:
             self.loading = True
             for index in range(self.monitored_nodes.count()):
                 self.monitored_nodes.item(index).setCheckState(Qt.CheckState.Checked)
-            self.loading = False
-        self._save_node()
+            self.loading = was_loading
+        if not was_loading:
+            self._save_node()
 
     def _add_node_folder(self) -> None:
         directory = QFileDialog.getExistingDirectory(

@@ -72,6 +72,7 @@ class WorkspaceListWidget(ResponsiveListWidget):
 class WorkspaceCard(QFrame):
     def __init__(self, session: WorkspaceSession, *, selected: bool) -> None:
         super().__init__()
+        self.setObjectName("workspaceCard")
         self.session = session
         self.selected = selected
 
@@ -96,7 +97,7 @@ class WorkspaceCard(QFrame):
         self.status_icon = QLabel()
         self.status_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_icon.setFixedWidth(24)
-        self.status_icon.setObjectName("workspaceStatusIcon")
+        self.status_icon.setObjectName("workspaceStatus")
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 4, 8, 4)
@@ -108,23 +109,13 @@ class WorkspaceCard(QFrame):
         self.refresh()
 
     def refresh(self, spinner_frame: int = 0) -> None:
-        rail_color = (
-            "#22C55E"
-            if self.selected
-            else ("#F59E0B" if self.session.is_loaded else "#64748B")
-        )
-        background = "#24324A" if self.selected else "#172033"
-        border = "#4ADE80" if self.selected else "#334155"
-        self.setStyleSheet(
-            "QFrame {"
-            f"background: {background}; border: 1px solid {border}; border-radius: 9px;"
-            "}"
-            f"QFrame#workspaceRail {{ background: {rail_color}; border: none; "
-            "border-radius: 2px; }"
-            "QLabel { border: none; background: transparent; }"
-            "QLabel#workspaceName { color: #F8FAFC; font-weight: 600; }"
-            "QLabel#workspaceStatusText { color: #94A3B8; font-size: 9pt; }"
-        )
+        self.setProperty("selected", self.selected)
+        rail_state = "selected" if self.selected else "loaded" if self.session.is_loaded else "idle"
+        self.rail.setProperty("state", rail_state)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.rail.style().unpolish(self.rail)
+        self.rail.style().polish(self.rail)
         dirty = " *" if self.session.dirty else ""
         self.name_label.setText(f"{self.session.display_name}{dirty}")
         self.name_label.setToolTip(self.session.display_name)
@@ -137,26 +128,26 @@ class WorkspaceCard(QFrame):
     def _update_status_icon(self, spinner_frame: int) -> None:
         state = self.session.run_state
         if state == "running":
-            icon, tooltip, color = (
+            icon, tooltip, visual_state = (
                 SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)],
                 "Виконується",
-                "#60A5FA",
+                "running",
             )
         elif state == "needs_attention":
-            icon, tooltip, color = "⚠", "Очікує на вашу відповідь", "#FBBF24"
+            icon, tooltip, visual_state = "⚠", "Очікує на вашу відповідь", "attention"
         elif state == "failed":
-            icon, tooltip, color = "✕", "Помилка виконання", "#F87171"
+            icon, tooltip, visual_state = "✕", "Помилка виконання", "failed"
         elif state == "paused":
-            icon, tooltip, color = "Ⅱ", "Призупинено", "#FBBF24"
+            icon, tooltip, visual_state = "Ⅱ", "Призупинено", "attention"
         elif self.session.unread_result:
-            icon, tooltip, color = "●", "Завершено — є новий результат", "#A78BFA"
+            icon, tooltip, visual_state = "●", "Завершено — є новий результат", "unread"
         else:
-            icon, tooltip, color = "", self.session.status_text, "#94A3B8"
+            icon, tooltip, visual_state = "", self.session.status_text, "idle"
         self.status_icon.setText(icon)
         self.status_icon.setToolTip(tooltip)
-        self.status_icon.setStyleSheet(
-            f"color: {color}; font-size: 17px; font-weight: 700; border: none;"
-        )
+        self.status_icon.setProperty("state", visual_state)
+        self.status_icon.style().unpolish(self.status_icon)
+        self.status_icon.style().polish(self.status_icon)
 
 
 class WorkspaceSidebar(QWidget):
@@ -171,6 +162,7 @@ class WorkspaceSidebar(QWidget):
         self._cards: dict[str, WorkspaceCard] = {}
         self._rebuilding = False
         self._pending: tuple[list[WorkspaceSession], str | None] | None = None
+        self._pending_refresh_scheduled = False
         self._spinner_frame = 0
 
         self.summary = QLabel("Немає активних Flow")
@@ -190,11 +182,6 @@ class WorkspaceSidebar(QWidget):
         self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_widget.itemClicked.connect(self._item_clicked)
         self.list_widget.customContextMenuRequested.connect(self._open_context_menu)
-        self.list_widget.setStyleSheet(
-            "QListWidget#workspaceList { background: transparent; border: none; }"
-            "QListWidget#workspaceList::item { background: transparent; border: none; }"
-            "QListWidget#workspaceList::item:selected { background: transparent; }"
-        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -211,25 +198,68 @@ class WorkspaceSidebar(QWidget):
     def set_sessions(
         self, sessions: Iterable[WorkspaceSession], selected_id: str | None
     ) -> None:
-        """Перебудувати список середовищ.
+        """Синхронізувати список середовищ без зайвого створення віджетів.
 
         Перебудова може викликати обробку відкладених подій (наприклад,
         події фонового запуску), а ті знову просять оновити панель. Тому
-        повторний виклик не перебудовує список одразу, а лише запам'ятовує
-        останній стан — інакше вкладений clear() видаляє елементи, з якими
-        ще працює зовнішній виклик.
+        повторний виклик запам'ятовує останній стан і виконується в наступному
+        проході event loop. Це не дає синхронному while-loop заблокувати UI.
         """
         self._pending = (list(sessions), selected_id)
         if self._rebuilding:
             return
+        self._apply_pending_sessions()
+
+    def _apply_pending_sessions(self) -> None:
+        self._pending_refresh_scheduled = False
+        if self._rebuilding or self._pending is None:
+            return
+        pending_sessions, pending_selected = self._pending
+        self._pending = None
         self._rebuilding = True
         try:
-            while self._pending is not None:
-                pending_sessions, pending_selected = self._pending
-                self._pending = None
-                self._rebuild(pending_sessions, pending_selected)
+            self._sync_sessions(pending_sessions, pending_selected)
         finally:
             self._rebuilding = False
+        if self._pending is not None and not self._pending_refresh_scheduled:
+            self._pending_refresh_scheduled = True
+            QTimer.singleShot(0, self._apply_pending_sessions)
+
+    def _sync_sessions(
+        self, sessions: list[WorkspaceSession], selected_id: str | None
+    ) -> None:
+        current_ids = [
+            str(self.list_widget.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.list_widget.count())
+        ]
+        new_ids = [session.id for session in sessions]
+        if current_ids != new_ids or any(
+            session_id not in self._cards for session_id in new_ids
+        ):
+            self._rebuild(sessions, selected_id)
+            return
+
+        self._sessions = sessions
+        self._selected_id = selected_id
+        blocked = self.list_widget.blockSignals(True)
+        try:
+            current: QListWidgetItem | None = None
+            for index, session in enumerate(sessions):
+                item = self.list_widget.item(index)
+                card = self._cards[session.id]
+                card.session = session
+                card.selected = session.id == selected_id
+                card.refresh(self._spinner_frame)
+                if card.selected:
+                    current = item
+            if current is not None:
+                self.list_widget.setCurrentItem(current)
+            else:
+                self.list_widget.clearSelection()
+        finally:
+            self.list_widget.blockSignals(blocked)
+        self._update_summary()
+        self._apply_filter(self.search.text())
 
     def _rebuild(
         self, sessions: list[WorkspaceSession], selected_id: str | None

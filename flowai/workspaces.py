@@ -42,8 +42,11 @@ class WorkspaceSession:
     saved_history_state: dict[str, Any] | None = None
     run_thread: Any = None
     run_worker: Any = None
+    file_watcher: Any = None
     log_entries: list[dict[str, Any]] = field(default_factory=list)
     generated_file_groups: list[dict[str, Any]] = field(default_factory=list)
+    active_file_node_id: str = ""
+    active_file_iteration: int = 0
     stop_requested: bool = False
 
     @property
@@ -74,6 +77,8 @@ class WorkspaceSession:
             return "Не завантажено"
         if self.dirty:
             return "Є незбережені зміни"
+        if self.run_state == "completed_with_failures":
+            return "Виконано з провалами"
         if self.run_state == "completed":
             return "Виконано"
         if self.run_state == "cancelled":
