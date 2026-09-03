@@ -39,6 +39,7 @@ class GrillWorker(QObject):
         reasoning_effort: str = "medium",
         calibration: Any | None = None,
         generated_files: list[str] | None = None,
+        review_feedback: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.workflow = workflow
@@ -47,6 +48,7 @@ class GrillWorker(QObject):
         self.reasoning_effort = reasoning_effort
         self.calibration = calibration
         self.generated_files = list(generated_files or [])
+        self.review_feedback = dict(review_feedback or {})
         self._codex: CodexAdapter | None = None
         self._session: GrillSession | None = None
         self._question: GrillQuestion | None = None
@@ -63,6 +65,7 @@ class GrillWorker(QObject):
                 reasoning_effort=self.reasoning_effort,
                 calibration=self.calibration,
                 generated_files=self.generated_files,
+                review_feedback=self.review_feedback,
             )
         return self._session
 
@@ -115,6 +118,7 @@ class GrillDialog(AnimatedDialog):
     question_requested = Signal()
     answer_submitted = Signal(str)
     finish_requested = Signal()
+    transcript_changed = Signal(object)
 
     def __init__(
         self,
@@ -126,6 +130,7 @@ class GrillDialog(AnimatedDialog):
         reasoning_effort: str = "medium",
         calibration: Any | None = None,
         generated_files: list[str] | None = None,
+        review_feedback: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(parent)
         self.workflow = workflow
@@ -134,7 +139,22 @@ class GrillDialog(AnimatedDialog):
         self.reasoning_effort = reasoning_effort
         self.calibration = calibration
         self.generated_files = list(generated_files or [])
+        self.review_feedback = dict(review_feedback or {})
         self.outcome: GrillOutcome | None = None
+        saved_transcript = self.review_feedback.get("grill_transcript")
+        self.transcript: list[dict[str, str]] = (
+            [
+                {
+                    "question": str(item.get("question") or "").strip(),
+                    "answer": str(item.get("answer") or "").strip(),
+                }
+                for item in saved_transcript
+                if isinstance(item, dict)
+                and (item.get("question") or item.get("answer"))
+            ]
+            if isinstance(saved_transcript, list)
+            else []
+        )
         self.decision = ""
         self.option_buttons: list[AnimatedButton] = []
         self._question_count = 0
@@ -143,9 +163,12 @@ class GrillDialog(AnimatedDialog):
         self._worker: GrillWorker | None = None
         self._started = False
 
-        self.setWindowTitle(
-            "Regenerate Prompt — GrillMe" if calibration is not None else "GrillMe"
-        )
+        if self.review_feedback:
+            self.setWindowTitle("Обговорити правки — GrillMe")
+        else:
+            self.setWindowTitle(
+                "Regenerate Prompt — GrillMe" if calibration is not None else "GrillMe"
+            )
         self.setMinimumSize(760, 620)
         root = QVBoxLayout(self)
         self.pages = QStackedWidget()
@@ -161,9 +184,7 @@ class GrillDialog(AnimatedDialog):
         layout.addStretch()
         heading = QLabel("Агент формулює питання…")
         heading.setObjectName("sectionTitle")
-        heading.setAlignment(
-            heading.alignment() | heading.alignment().AlignHCenter
-        )
+        heading.setAlignment(heading.alignment() | heading.alignment().AlignHCenter)
         layout.addWidget(heading)
         note = QLabel("GrillMe шукає неоднозначності й пропущені рішення")
         note.setObjectName("mutedLabel")
@@ -233,14 +254,14 @@ class GrillDialog(AnimatedDialog):
         self.diff_scroll.setWidget(self.diff_widget)
         layout.addWidget(self.diff_scroll, 1)
         controls = QHBoxLayout()
-        run = AnimatedButton("Запустити", "primary", "play")
-        edit = AnimatedButton("Edit", "secondary")
+        self.run_button = AnimatedButton("Запустити", "primary", "play")
+        self.edit_button = AnimatedButton("Edit", "secondary")
         cancel = AnimatedButton("Скасувати", "ghost")
-        run.clicked.connect(lambda: self._decide("run"))
-        edit.clicked.connect(lambda: self._decide("edit"))
+        self.run_button.clicked.connect(lambda: self._decide("run"))
+        self.edit_button.clicked.connect(lambda: self._decide("edit"))
         cancel.clicked.connect(self.reject)
-        controls.addWidget(run)
-        controls.addWidget(edit)
+        controls.addWidget(self.run_button)
+        controls.addWidget(self.edit_button)
         controls.addStretch()
         controls.addWidget(cancel)
         layout.addLayout(controls)
@@ -288,6 +309,11 @@ class GrillDialog(AnimatedDialog):
             self._submit(answer)
 
     def _submit(self, answer: str) -> None:
+        question = self._current_question
+        if question is not None:
+            self.transcript.append({"question": question.text, "answer": answer})
+            self.transcript_changed.emit(list(self.transcript))
+            self._current_question = None
         self.pages.setCurrentWidget(self.waiting_page)
         self.answer_submitted.emit(answer)
 
@@ -313,6 +339,20 @@ class GrillDialog(AnimatedDialog):
         self.outcome = outcome
         self.summary.setText(outcome.summary or "Домовленості зібрано.")
         self._clear_layout(self.diff_layout)
+        if self.review_feedback:
+            title = QLabel("Підсумкові правки для виконавчої ноди")
+            title.setObjectName("sectionTitle")
+            self.diff_layout.addWidget(title)
+            self.feedback_editor = QPlainTextEdit(outcome.feedback)
+            self.feedback_editor.setPlaceholderText(
+                "Остаточні правки, які отримає нода"
+            )
+            self.diff_layout.addWidget(self.feedback_editor, 1)
+            self.run_button.setText("Відправити правки")
+            self.edit_button.hide()
+            self.pages.setCurrentWidget(self.ready_page)
+            self._stop_thread()
+            return
         old = self._old_prompts()
         changes = dict(outcome.rewritten_tasks)
         if outcome.rewritten_entry:
@@ -344,6 +384,9 @@ class GrillDialog(AnimatedDialog):
     def diff_text(self) -> str:
         if self.outcome is None:
             return ""
+        if self.review_feedback:
+            editor = getattr(self, "feedback_editor", None)
+            return editor.toPlainText() if editor is not None else self.outcome.feedback
         old = self._old_prompts()
         lines: list[str] = []
         for task_id, prompt in self.outcome.rewritten_tasks.items():
@@ -353,6 +396,10 @@ class GrillDialog(AnimatedDialog):
         return "\n".join(lines)
 
     def _decide(self, decision: str) -> None:
+        if self.review_feedback and self.outcome is not None:
+            editor = getattr(self, "feedback_editor", None)
+            if editor is not None:
+                self.outcome.feedback = editor.toPlainText().strip()
         self.decision = decision
         self.accept()
 
@@ -368,6 +415,7 @@ class GrillDialog(AnimatedDialog):
             reasoning_effort=self.reasoning_effort,
             calibration=self.calibration,
             generated_files=self.generated_files,
+            review_feedback=self.review_feedback,
         )
         worker.moveToThread(thread)
         self.question_requested.connect(worker.request_question)

@@ -241,3 +241,82 @@ def test_session_without_calibration_behaves_as_before(tmp_path: Path) -> None:
     question = session.next_question()
     assert question is not None
     assert question.text == "Перше?"
+
+
+def test_review_feedback_context_is_grilled_without_the_materials_question(
+    tmp_path: Path,
+) -> None:
+    codex = FakeCodex(
+        [
+            json.dumps(
+                {
+                    "done": False,
+                    "question": "Лишити дах?",
+                    "options": ["Так", "Ні"],
+                    "rationale": "Є конфлікт",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    session = GrillSession(
+        make_workflow(),
+        codex,
+        "gpt-5.6-terra",
+        tmp_path,
+        review_feedback={
+            "node_title": "Показати результат",
+            "verdict": False,
+            "score": 72,
+            "reason": "Контур перетинає дерево",
+            "must_fix": ["Перемалювати контур"],
+            "candidate_path": "C:/out/review.png",
+            "user_note": "Дах не змінювати",
+            "user_requirements": [
+                "Теплиця та рослини всередині є однією групою"
+            ],
+        },
+    )
+
+    question = session.next_question()
+
+    assert question is not None
+    assert question.text == "Лишити дах?"
+    prompt = str(codex.calls[0]["prompt"])
+    assert "Контур перетинає дерево" in prompt
+    assert "Дах не змінювати" in prompt
+    assert "Теплиця та рослини всередині є однією групою" in prompt
+    assert MATERIALS_QUESTION not in prompt
+
+
+def test_review_feedback_finish_returns_an_instruction_not_prompt_rewrites(
+    tmp_path: Path,
+) -> None:
+    codex = FakeCodex(
+        [
+            json.dumps(
+                {
+                    "summary": "Узгоджено геометрію",
+                    "feedback": "Перемалюй контур, але не змінюй дах",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    session = GrillSession(
+        make_workflow(),
+        codex,
+        "gpt-5.6-terra",
+        tmp_path,
+        review_feedback={
+            "verdict": False,
+            "reason": "Контур неточний",
+            "user_note": "Дах не змінювати",
+        },
+    )
+
+    outcome = session.finish()
+
+    assert outcome.feedback == "Перемалюй контур, але не змінюй дах"
+    assert outcome.rewritten_tasks == {}
+    assert "Не змінюй Flow" in str(codex.calls[0]["prompt"])

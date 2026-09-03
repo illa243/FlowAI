@@ -1,0 +1,887 @@
+{
+  "format_version": 2,
+  "name": "Game UI · 4 concepts → layered PSD",
+  "workspace": "",
+  "additional_folders": [
+    "C:\\Users\\illia\\Desktop\\UI_refs"
+  ],
+  "grill_summary": "Рішення користувача мають пріоритет. План Tasks погоджується один раз; PSD створюється лише після затвердження PNG. Стиль макетів має рівнятися на затверджений кеш аналізу 66 референсів modern-ui, а не запускати повний аналіз теки повторно.",
+  "nodes": [
+    {
+      "id": "ui-entry",
+      "kind": "entry",
+      "title": "UI brief · once",
+      "x": -1260,
+      "y": -320,
+      "config": {
+        "text": "Платформа фіксована: портретний казуальний мобайл (1080×1920, aspect 9:16…9:21). Опишіть UI-задачу, екрани, стани, стиль і обмеження. Додайте референси.",
+        "json": {},
+        "attachments": []
+      }
+    },
+    {
+      "id": "ui-planner",
+      "kind": "prompt_reviewer",
+      "title": "UI Planner",
+      "x": -990,
+      "y": -320,
+      "config": {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "sandbox": "read-only",
+        "memory": "thread",
+        "skills": [
+          {
+            "name": "modern-ui",
+            "path": "C:\\Users\\illia\\.codex\\skills\\modern-ui"
+          }
+        ],
+        "reference_cache": {
+          "mode": "sha256_once",
+          "source_dir": "C:\\Users\\illia\\Desktop\\UI_refs",
+          "manifest_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\reference-manifest.json",
+          "analysis_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\ui-reference-analysis.md",
+          "library_sha256": "efb174469a315311007dda9aea6d8ee12c7bd8566ca0debbd1bf11178e10b6b4"
+        },
+        "instructions": "Перетвори одноразовий brief на UI project spec для портретного мобільного казуалу. platform завжди portrait_mobile. Дефолти, якщо brief не каже іншого: canvas 1080×1920, aspect_range 9:16…9:21, safe_area top 132 / bottom 100 / left 0 / right 0; кожне перевизначення винось у assumptions. Обери одну primary reference family і не більше двох supporting traits ОДИН РАЗ на весь проєкт у art_direction — не per-task; рівняйся на перевірений modern-ui analysis і не запускай повторний аналіз референсів. Першим task зроби UI kit, який видає ui_kit.json з токенами стилю (палітра, радіуси, рамки, шрифтові ролі, матеріали кнопок); кожен наступний screen task несе ui_kit_ref і anchor_plan. Один наступний task — один екран з усіма застосовними станами. States тільки зі словника: default, pressed, disabled, selected, locked, claimed, available, insufficient_currency, loading, empty, error; курсорні стани (hover, focus) заборонені. Обов'язковий мінімум станів виводь із ролі елемента: кнопка — default+pressed+disabled; купівля — плюс insufficient_currency; колекційний елемент — плюс locked+claimed; перемикач/таб — плюс selected; список — default+loading+empty. Кожен текстовий контрол проєктуй із запасом довжини рядка не менше 30%. Не приховуй відсутні дані: запиши їх у assumptions. Для restyle зберігай геометрію, якщо redesign не дозволено. Усі output paths тільки відносно теки проєкту.",
+        "prompt": "# Одноразовий brief\n{{entry_prompt}}\n\n# Рішення GrillMe\n{{grill_summary}}\n\nПоверни JSON з ui_project_spec і tasks. Spec повинен мати platform, canvas із safe_area та aspect_range, art_direction із primary_reference_family. Кожен task повинен мати id, title, prompt, screen, states, anchor_plan, ui_kit_ref, acceptance_criteria, attachments та export_profile (baseline або sliced).",
+        "prompt_source": "template",
+        "output_format": "json",
+        "output_schema": {
+          "ui_project_spec": {
+            "operation": "create|restyle|modify",
+            "platform": "string",
+            "engine_profile": "baseline|unity|unreal|custom",
+            "canvas": {
+              "width": 0,
+              "height": 0
+            },
+            "art_direction": "string",
+            "constraints": [
+              "string"
+            ],
+            "references": [
+              "string"
+            ],
+            "assumptions": [
+              "string"
+            ],
+            "tasks": [
+              {
+                "id": "string",
+                "title": "string",
+                "prompt": "string",
+                "screen": "string",
+                "states": [
+                  "string"
+                ],
+                "acceptance_criteria": [
+                  "string"
+                ],
+                "attachments": [
+                  "string"
+                ],
+                "export_profile": "baseline"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "plan-qa",
+      "kind": "task_reviewer",
+      "title": "Plan QA",
+      "x": -720,
+      "y": -320,
+      "config": {
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "high",
+        "sandbox": "read-only",
+        "memory": "fresh",
+        "skills": [
+          {
+            "name": "modern-ui",
+            "path": "C:\\Users\\illia\\.codex\\skills\\modern-ui"
+          }
+        ],
+        "reference_cache": {
+          "mode": "sha256_once",
+          "source_dir": "C:\\Users\\illia\\Desktop\\UI_refs",
+          "manifest_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\reference-manifest.json",
+          "analysis_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\ui-reference-analysis.md",
+          "library_sha256": "efb174469a315311007dda9aea6d8ee12c7bd8566ca0debbd1bf11178e10b6b4"
+        },
+        "criteria_node": "ui-entry",
+        "instructions": "Перевір повноту UI project spec для портретного мобільного казуалу. Blocking: platform не portrait_mobile; немає canvas із safe_area та aspect_range; курсорні стани (hover, focus, mouse-over); немає tasks; task не самодостатній; для create немає UI kit task із ui_kit.json; screen task не містить станів, обов'язкових для ролей його елементів (кнопка — default+pressed+disabled тощо); primary reference family вибрана не один раз на проєкт, а per-task, або не вибрана взагалі; assumptions приховані. Style direction має спиратися на перевірений modern-ui analysis.",
+        "prompt": "# Brief\n{{criteria}}\n\n# Запропонований UI project spec\n{{work}}\n\nПоверни QA schema зі stable defect_id.",
+        "output_format": "json"
+      }
+    },
+    {
+      "id": "plan-result",
+      "kind": "result",
+      "title": "Plan Approval",
+      "x": -450,
+      "y": -320,
+      "config": {
+        "wait_for_confirmation": true,
+        "confirmation_mode": "plan_approval",
+        "confirmation_ports": [
+          "true"
+        ],
+        "final_task_result": false,
+        "retry_guard_enabled": true,
+        "retry_guard_threshold": 2,
+        "learning_enabled": true,
+        "true_limit": 3,
+        "false_limit": 10
+      }
+    },
+    {
+      "id": "ui-tasks",
+      "kind": "tasks_manager",
+      "title": "Dynamic UI Tasks",
+      "x": -160,
+      "y": -320,
+      "config": {
+        "task_source": "input_once",
+        "plan_save_path": "ui_project_spec.json",
+        "tasks": [
+          {
+            "id": "runtime-plan",
+            "prompt": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "concept-executor",
+      "kind": "executor",
+      "title": "Concept Executor · V01–V04",
+      "x": 130,
+      "y": -320,
+      "config": {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "sandbox": "workspace-write",
+        "memory": "thread",
+        "skills": [
+          {
+            "name": "modern-ui",
+            "path": "C:\\Users\\illia\\.codex\\skills\\modern-ui"
+          }
+        ],
+        "reference_cache": {
+          "mode": "sha256_once",
+          "source_dir": "C:\\Users\\illia\\Desktop\\UI_refs",
+          "manifest_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\reference-manifest.json",
+          "analysis_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\ui-reference-analysis.md",
+          "library_sha256": "efb174469a315311007dda9aea6d8ee12c7bd8566ca0debbd1bf11178e10b6b4"
+        },
+        "prompt_source": "input",
+        "variant_contract_enabled": true,
+        "enforce_project_outputs": true,
+        "instructions": "Малюй через Photoshop 2022 COM/JSX (runtime JSX лише в .flowai/runtime/): для кожного варіанта побудуй шаровий документ V0N.psd у tasks/<task-id>/concepts/round-NNN/ і з нього експортуй два PNG: V0N.png — екран на повний canvas в основному стані (канонічний артефакт) і V0N_board.png — той самий екран плюс прев'ю решти застосовних станів. Поруч поклади V0N_layout.json з точною геометрією з документа: bbox кожного інтерактивного елемента, роль, anchor, states, окремі tap_box і text_box, nine_slice margins для масштабованих панелей, critical для контролів, яким заборонено заходити в safe area. Дотримуй §2.2: tap_box не менше 144×144 px, проміжок між сусідніми tap_box не менше 24 px, критичні контроли поза safe area, текст із запасом ≥30% і тільки живими шарами. Ілюстративні ділянки (персонажі, пропси, мальовані фони) — art-placeholder шари з префіксом ART_ у правильному боксі плюс бриф у art_requests.json; якщо в references/art/ є готовий асет — встав його. Стиль: одна primary reference family проєкту і токени ui_kit.json; не перечитуй усі 66 джерел повторно. Функція, canvas, контент, states і art-placeholder бокси однакові в усіх чотирьох варіантів; композиція, hierarchy, shape language, materials і decoration різні. Збережи старі раунди. Створи manifest.json з SHA-256 обох PNG. На retry змінюй лише retry_variant_ids; інші файли й hash недоторканні. Усі записи лише в теці проєкту.",
+        "output_format": "json",
+        "output_schema": {
+          "task_id": "string",
+          "round_id": "round-001",
+          "variants": [
+            {
+              "variant_id": "V01",
+              "path": "string",
+              "sha256": "HEX",
+              "board_path": "string",
+              "board_sha256": "HEX",
+              "layout_manifest_path": "string",
+              "psd_path": "string",
+              "direction": "string",
+              "qa_status": "pending",
+              "supersedes": null
+            }
+          ],
+          "manifest_path": "string",
+          "art_requests_path": "string"
+        },
+        "photoshop_preflight": true
+      }
+    },
+    {
+      "id": "concept-qa",
+      "kind": "task_reviewer",
+      "title": "Concept QA",
+      "x": 420,
+      "y": -320,
+      "config": {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+        "sandbox": "read-only",
+        "memory": "fresh",
+        "skills": [
+          {
+            "name": "modern-ui",
+            "path": "C:\\Users\\illia\\.codex\\skills\\modern-ui"
+          }
+        ],
+        "reference_cache": {
+          "mode": "sha256_once",
+          "source_dir": "C:\\Users\\illia\\Desktop\\UI_refs",
+          "manifest_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\reference-manifest.json",
+          "analysis_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\ui-reference-analysis.md",
+          "library_sha256": "efb174469a315311007dda9aea6d8ee12c7bd8566ca0debbd1bf11178e10b6b4"
+        },
+        "criteria_node": "ui-tasks",
+        "instructions": "Перевір V01–V04 окремо. Спершу числа за V0N_layout.json: tap_box ≥144×144 px (абсолютний мінімум 132), проміжки між tap_box ≥24 px, критичні контроли всередині safe area, у кожного елемента є anchor, states відповідають ролі (кнопка — default+pressed+disabled; купівля — плюс insufficient_currency; колекційний — плюс locked+claimed; перемикач — плюс selected; список — default+loading+empty), текст не торкається країв text_box, масштабовані елементи мають nine_slice. Порушення цих правил — technical_blocker, не visual_preference. Звір манифест із PNG: невидимий елемент манифеста або видимий контрол без запису — blocking. Потім стиль: відповідність primary reference family проєкту і токенам ui_kit.json; відхилення від токенів — technical_blocker. Art-placeholder не дефект, якщо бокс правильний і описаний в art_requests.json; валити за відсутність намальованого арту заборонено. Порівняй manifest, файли й SHA-256 обох PNG. Не відхиляй прийняті варіанти через дефект іншого. Поверни retry_variant_ids тільки для failed variants і stable defect_id.",
+        "prompt": "# Task/spec\n{{criteria}}\n\n# Concept round\n{{work}}\n\nПоверни verdict, score, variant_reviews, retry_variant_ids, issues, must_fix та evidence_files.",
+        "output_format": "json"
+      }
+    },
+    {
+      "id": "variant-result",
+      "kind": "result",
+      "title": "Choose V01–V04",
+      "x": 710,
+      "y": -320,
+      "config": {
+        "wait_for_confirmation": true,
+        "confirmation_mode": "variant_selection",
+        "confirmation_ports": [
+          "true"
+        ],
+        "final_task_result": false,
+        "retry_guard_enabled": true,
+        "retry_guard_threshold": 2,
+        "learning_enabled": true,
+        "true_limit": 30,
+        "false_limit": 60
+      }
+    },
+    {
+      "id": "synthesis-executor",
+      "kind": "executor",
+      "title": "Synthesis PNG",
+      "x": 770,
+      "y": 20,
+      "config": {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "sandbox": "workspace-write",
+        "memory": "thread",
+        "skills": [
+          {
+            "name": "modern-ui",
+            "path": "C:\\Users\\illia\\.codex\\skills\\modern-ui"
+          }
+        ],
+        "reference_cache": {
+          "mode": "sha256_once",
+          "source_dir": "C:\\Users\\illia\\Desktop\\UI_refs",
+          "manifest_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\reference-manifest.json",
+          "analysis_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\ui-reference-analysis.md",
+          "library_sha256": "efb174469a315311007dda9aea6d8ee12c7bd8566ca0debbd1bf11178e10b6b4"
+        },
+        "prompt_source": "input",
+        "enforce_project_outputs": true,
+        "instructions": "Поєднай лише вибрані variant IDs відповідно до note користувача. Працюй за тим самим контрактом, що й концепти: через Photoshop 2022 COM/JSX побудуй новий шаровий документ у tasks/<task-id>/synthesis/round-NNN/ і з нього експортуй екран S01.png, борд S01_board.png та S01_layout.json; дотримуй правила §2.2 (tap_box, safe area, anchor, живий текст із запасом, nine_slice, art-placeholder з ART_ і брифом в art_requests.json). Створи manifest. Поверни selection_note дослівно, щоб Synthesis QA міг перевірити кожну вказівку користувача. Стадію PSD Builder не починай — доведення документа до вимог §6 відбувається після затвердження.",
+        "output_format": "json",
+        "output_schema": {
+          "candidate_path": "string",
+          "manifest_path": "string",
+          "source_variant_ids": [
+            "V01"
+          ],
+          "selection_note": "string",
+          "sha256": "HEX"
+        },
+        "photoshop_preflight": true
+      }
+    },
+    {
+      "id": "synthesis-qa",
+      "kind": "task_reviewer",
+      "title": "Synthesis QA",
+      "x": 1060,
+      "y": 20,
+      "config": {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "sandbox": "read-only",
+        "memory": "fresh",
+        "skills": [
+          {
+            "name": "modern-ui",
+            "path": "C:\\Users\\illia\\.codex\\skills\\modern-ui"
+          }
+        ],
+        "reference_cache": {
+          "mode": "sha256_once",
+          "source_dir": "C:\\Users\\illia\\Desktop\\UI_refs",
+          "manifest_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\reference-manifest.json",
+          "analysis_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\ui-reference-analysis.md",
+          "library_sha256": "efb174469a315311007dda9aea6d8ee12c7bd8566ca0debbd1bf11178e10b6b4"
+        },
+        "criteria_node": "variant-result",
+        "instructions": "Перевір, що Synthesis реалізує note і вибрані напрями, не втрачаючи функціональних вимог task. Звір числа за S01_layout.json тими самими правилами, що й Concept QA (tap_box, safe area, anchor, states за роллю, text_box, nine_slice); порушення — technical_blocker. Поверни stable defect_id.",
+        "output_format": "json"
+      }
+    },
+    {
+      "id": "synthesis-result",
+      "kind": "result",
+      "title": "Approve Synthesis PNG",
+      "x": 1350,
+      "y": 20,
+      "config": {
+        "wait_for_confirmation": true,
+        "confirmation_mode": "asset_approval",
+        "confirmation_ports": [
+          "true"
+        ],
+        "final_task_result": false,
+        "retry_guard_enabled": true,
+        "retry_guard_threshold": 2,
+        "learning_enabled": true,
+        "true_limit": 30,
+        "false_limit": 60
+      }
+    },
+    {
+      "id": "psd-builder",
+      "kind": "executor",
+      "title": "PSD Builder · Photoshop 2022",
+      "x": 1060,
+      "y": -320,
+      "config": {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+        "sandbox": "workspace-write",
+        "memory": "thread",
+        "skills": [
+          {
+            "name": "modern-ui",
+            "path": "C:\\Users\\illia\\.codex\\skills\\modern-ui"
+          }
+        ],
+        "reference_cache": {
+          "mode": "sha256_once",
+          "source_dir": "C:\\Users\\illia\\Desktop\\UI_refs",
+          "manifest_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\reference-manifest.json",
+          "analysis_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\ui-reference-analysis.md",
+          "library_sha256": "efb174469a315311007dda9aea6d8ee12c7bd8566ca0debbd1bf11178e10b6b4"
+        },
+        "prompt_source": "input",
+        "photoshop_required": true,
+        "enforce_project_outputs": true,
+        "instructions": "Не малюй екран заново: відкрий psd_path затвердженого варіанта — той самий документ, з якого експортовано затверджений PNG, — і доведи його до вимог §6 через Photoshop 2022 COM/JSX. Створи groups Background, Frame, Header, Content, Controls, Icons, Text, States і Layer Comps. Text, buttons, panels, icons і states редаговані; текст існує тільки живими текстовими шарами і ніколи не запечений у растр контролу. Складні art/texture — окремі растрові Smart Objects; art-placeholder шари підписані ART_ і відповідають art_requests.json. Масштабовані панелі та кнопки мають однорідний центр, придатний для 9-slice, а margins записані в layout manifest. Віднови прихований фон під відокремленими елементами. Composite має збігатися із затвердженим V0N.png (не бордом). Створи state PNG exports, онови layout manifest і manifest. Runtime JSX лише в .flowai/runtime/. Поверни candidate_path PSD.",
+        "output_format": "json",
+        "output_schema": {
+          "candidate_path": "tasks/task-id/psd/screen.psd",
+          "composite_preview": "string",
+          "exports": [
+            "string"
+          ],
+          "manifest_path": "string",
+          "states": [
+            "string"
+          ]
+        }
+      }
+    },
+    {
+      "id": "psd-qa",
+      "kind": "task_reviewer",
+      "title": "PSD QA",
+      "x": 1350,
+      "y": -320,
+      "config": {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+        "sandbox": "read-only",
+        "memory": "fresh",
+        "skills": [
+          {
+            "name": "modern-ui",
+            "path": "C:\\Users\\illia\\.codex\\skills\\modern-ui"
+          }
+        ],
+        "reference_cache": {
+          "mode": "sha256_once",
+          "source_dir": "C:\\Users\\illia\\Desktop\\UI_refs",
+          "manifest_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\reference-manifest.json",
+          "analysis_path": "C:\\Users\\illia\\.codex\\skills\\modern-ui\\references\\ui-reference-analysis.md",
+          "library_sha256": "efb174469a315311007dda9aea6d8ee12c7bd8566ca0debbd1bf11178e10b6b4"
+        },
+        "criteria_node": "ui-tasks",
+        "instructions": "Blocking checklist: PSD відкривається; canvas/profile правильні (1080×1920, якщо spec не каже іншого); groups, editable text і Layer Comps існують; увесь текст — живі текстові шари, не растр; ART_-шари відповідають art_requests.json; масштабовані елементи мають однорідний центр і записані nine_slice margins; немає broken links; усі states/exports/manifest на місці; layout manifest оновлений і збігається з документом; composite збігається із затвердженим V0N.png — борд у порівнянні не бере участі. Порушення правил §2.2 — technical_blocker. Відділяй visual_preference від visual_mismatch, technical_blocker і missing_requirement. Використовуй stable defect_id.",
+        "prompt": "# Task/spec\n{{criteria}}\n\n# PSD package and Photoshop validation\n{{work}}\n\nПоверни повну QA schema.",
+        "output_format": "json"
+      }
+    },
+    {
+      "id": "asset-result",
+      "kind": "result",
+      "title": "Final PSD Approval",
+      "x": 1640,
+      "y": -320,
+      "config": {
+        "wait_for_confirmation": true,
+        "confirmation_mode": "asset_approval",
+        "confirmation_ports": [
+          "true"
+        ],
+        "final_task_result": true,
+        "retry_guard_enabled": true,
+        "retry_guard_threshold": 2,
+        "learning_enabled": true,
+        "true_limit": 99,
+        "false_limit": 99
+      }
+    },
+    {
+      "id": "ui-curator",
+      "kind": "work_reviewer",
+      "title": "UI Knowledge Curator",
+      "x": 440,
+      "y": 330,
+      "config": {
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "high",
+        "sandbox": "workspace-write",
+        "memory": "thread",
+        "monitor_all": true,
+        "review_triggers": [
+          "qa_review",
+          "user_review",
+          "task_finished",
+          "run_finished"
+        ],
+        "learning_log_path": "learnings/ui_learnings.jsonl",
+        "project_profile_path": "learnings/ui_project_profile.md",
+        "skill_proposals_path": "learnings/skill-proposals",
+        "report_path": "learnings/ui-curator-report.md",
+        "instructions": "Аналізуй QA і рішення користувача. Не змінюй глобальний modern-ui. Локальні правила проєкту мають бути конкретними й не суперечити останньому рішенню користувача. Для глобального skill створюй лише diff-пропозицію, яку ще має підтвердити користувач.",
+        "prompt": "# Flow protocol\n{{protocol_path}}\n\nОнови висновки локального UI profile і підготуй лише доречні skill proposals."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e01",
+      "source": "ui-entry",
+      "target": "ui-planner",
+      "source_port": "out",
+      "source_path": "text",
+      "target_variable": "entry_prompt",
+      "condition": "",
+      "transform": "",
+      "label": "одноразовий brief",
+      "control_points": []
+    },
+    {
+      "id": "e02",
+      "source": "ui-entry",
+      "target": "ui-planner",
+      "source_port": "out",
+      "source_path": "data.attachments",
+      "target_variable": "attachments",
+      "condition": "",
+      "transform": "",
+      "label": "референси",
+      "control_points": [
+        {
+          "x": -1130,
+          "y": -210
+        },
+        {
+          "x": -1040,
+          "y": -210
+        }
+      ]
+    },
+    {
+      "id": "e03",
+      "source": "ui-planner",
+      "target": "plan-qa",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "work",
+      "condition": "",
+      "transform": "",
+      "label": "ui_project_spec",
+      "control_points": []
+    },
+    {
+      "id": "e04",
+      "source": "ui-planner",
+      "target": "plan-result",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "ui_plan",
+      "condition": "",
+      "transform": "",
+      "label": "план для редагування",
+      "control_points": [
+        {
+          "x": -850,
+          "y": -430
+        },
+        {
+          "x": -520,
+          "y": -430
+        }
+      ]
+    },
+    {
+      "id": "e05",
+      "source": "plan-qa",
+      "target": "plan-result",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "review",
+      "condition": "",
+      "transform": "",
+      "label": "QA плану",
+      "control_points": []
+    },
+    {
+      "id": "e06",
+      "source": "plan-result",
+      "target": "ui-planner",
+      "source_port": "false",
+      "source_path": "data.retry_context",
+      "target_variable": "entry_prompt",
+      "condition": "",
+      "transform": "",
+      "label": "уточнити план",
+      "control_points": [
+        {
+          "x": -420,
+          "y": -540
+        },
+        {
+          "x": -1030,
+          "y": -540
+        }
+      ]
+    },
+    {
+      "id": "e07",
+      "source": "plan-result",
+      "target": "ui-tasks",
+      "source_port": "true",
+      "source_path": "data.approved_plan",
+      "target_variable": "approved_plan",
+      "condition": "",
+      "transform": "",
+      "label": "frozen tasks",
+      "control_points": []
+    },
+    {
+      "id": "e08",
+      "source": "ui-tasks",
+      "target": "concept-executor",
+      "source_port": "next",
+      "source_path": "data.prompt",
+      "target_variable": "prompt",
+      "condition": "",
+      "transform": "",
+      "label": "поточний screen task",
+      "control_points": []
+    },
+    {
+      "id": "e09",
+      "source": "ui-tasks",
+      "target": "concept-executor",
+      "source_port": "next",
+      "source_path": "data.attachments",
+      "target_variable": "attachments",
+      "condition": "",
+      "transform": "",
+      "label": "task refs",
+      "control_points": [
+        {
+          "x": -20,
+          "y": -210
+        },
+        {
+          "x": 80,
+          "y": -210
+        }
+      ]
+    },
+    {
+      "id": "e10",
+      "source": "concept-executor",
+      "target": "concept-qa",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "work",
+      "condition": "",
+      "transform": "",
+      "label": "4 PNG + manifest",
+      "control_points": []
+    },
+    {
+      "id": "e11",
+      "source": "concept-executor",
+      "target": "variant-result",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "concepts",
+      "condition": "",
+      "transform": "",
+      "label": "V01–V04",
+      "control_points": [
+        {
+          "x": 280,
+          "y": -430
+        },
+        {
+          "x": 650,
+          "y": -430
+        }
+      ]
+    },
+    {
+      "id": "e12",
+      "source": "concept-qa",
+      "target": "variant-result",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "review",
+      "condition": "",
+      "transform": "",
+      "label": "per-variant QA",
+      "control_points": []
+    },
+    {
+      "id": "e13",
+      "source": "variant-result",
+      "target": "concept-executor",
+      "source_port": "false",
+      "source_path": "data.retry_context",
+      "target_variable": "prompt",
+      "condition": "",
+      "transform": "",
+      "label": "лише failed variants",
+      "control_points": [
+        {
+          "x": 690,
+          "y": -570
+        },
+        {
+          "x": 170,
+          "y": -570
+        }
+      ]
+    },
+    {
+      "id": "e14",
+      "source": "variant-result",
+      "target": "psd-builder",
+      "source_port": "true",
+      "source_path": "data",
+      "target_variable": "prompt",
+      "condition": "source.data.selection_mode == 'single'",
+      "transform": "",
+      "label": "один варіант",
+      "control_points": []
+    },
+    {
+      "id": "e15",
+      "source": "variant-result",
+      "target": "synthesis-executor",
+      "source_port": "true",
+      "source_path": "data",
+      "target_variable": "prompt",
+      "condition": "source.data.selection_mode == 'multiple'",
+      "transform": "",
+      "label": "поєднати вибрані",
+      "control_points": [
+        {
+          "x": 830,
+          "y": -150
+        },
+        {
+          "x": 830,
+          "y": -40
+        }
+      ]
+    },
+    {
+      "id": "e16",
+      "source": "synthesis-executor",
+      "target": "synthesis-qa",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "work",
+      "condition": "",
+      "transform": "",
+      "label": "synthesis PNG",
+      "control_points": []
+    },
+    {
+      "id": "e17",
+      "source": "synthesis-executor",
+      "target": "synthesis-result",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "work",
+      "condition": "",
+      "transform": "",
+      "label": "PNG для огляду",
+      "control_points": [
+        {
+          "x": 920,
+          "y": 140
+        },
+        {
+          "x": 1300,
+          "y": 140
+        }
+      ]
+    },
+    {
+      "id": "e18",
+      "source": "synthesis-qa",
+      "target": "synthesis-result",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "review",
+      "condition": "",
+      "transform": "",
+      "label": "synthesis QA",
+      "control_points": []
+    },
+    {
+      "id": "e19",
+      "source": "synthesis-result",
+      "target": "synthesis-executor",
+      "source_port": "false",
+      "source_path": "data.retry_context",
+      "target_variable": "prompt",
+      "condition": "",
+      "transform": "",
+      "label": "правки synthesis",
+      "control_points": [
+        {
+          "x": 1370,
+          "y": 250
+        },
+        {
+          "x": 790,
+          "y": 250
+        }
+      ]
+    },
+    {
+      "id": "e20",
+      "source": "synthesis-result",
+      "target": "psd-builder",
+      "source_port": "true",
+      "source_path": "data",
+      "target_variable": "prompt",
+      "condition": "",
+      "transform": "",
+      "label": "затверджений synthesis",
+      "control_points": [
+        {
+          "x": 1470,
+          "y": -80
+        },
+        {
+          "x": 1120,
+          "y": -80
+        }
+      ]
+    },
+    {
+      "id": "e21",
+      "source": "psd-builder",
+      "target": "psd-qa",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "work",
+      "condition": "",
+      "transform": "",
+      "label": "PSD package",
+      "control_points": []
+    },
+    {
+      "id": "e22",
+      "source": "psd-builder",
+      "target": "asset-result",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "work",
+      "condition": "",
+      "transform": "",
+      "label": "PSD + previews",
+      "control_points": [
+        {
+          "x": 1190,
+          "y": -430
+        },
+        {
+          "x": 1580,
+          "y": -430
+        }
+      ]
+    },
+    {
+      "id": "e23",
+      "source": "psd-qa",
+      "target": "asset-result",
+      "source_port": "out",
+      "source_path": "data",
+      "target_variable": "review",
+      "condition": "",
+      "transform": "",
+      "label": "PSD QA",
+      "control_points": []
+    },
+    {
+      "id": "e24",
+      "source": "asset-result",
+      "target": "psd-builder",
+      "source_port": "false",
+      "source_path": "data.retry_context",
+      "target_variable": "prompt",
+      "condition": "",
+      "transform": "",
+      "label": "виправити PSD",
+      "control_points": [
+        {
+          "x": 1660,
+          "y": -570
+        },
+        {
+          "x": 1090,
+          "y": -570
+        }
+      ]
+    },
+    {
+      "id": "e25",
+      "source": "asset-result",
+      "target": "ui-tasks",
+      "source_port": "true",
+      "source_path": "data.task_transition_receipt",
+      "target_variable": "task_transition",
+      "condition": "",
+      "transform": "",
+      "label": "наступний task",
+      "control_points": [
+        {
+          "x": 1770,
+          "y": -700
+        },
+        {
+          "x": -80,
+          "y": -700
+        }
+      ]
+    }
+  ]
+}

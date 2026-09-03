@@ -24,8 +24,11 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QSizePolicy
 
 from flowai import codex_adapter
+from flowai.engine import RunCheckpoint
+from flowai.grill import GrillOutcome
 from flowai.models import NODE_COLORS, FlowEdge, FlowNode, Workflow
 from flowai.persistence import load_workflow, save_workflow
+from flowai.run_history import save_checkpoint
 from flowai.ui import main_window as main_window_module
 from flowai.ui.canvas import FlowScene, FlowView
 from flowai.ui.inspector import (
@@ -255,6 +258,55 @@ def test_run_worker_throttles_activity_bursts_but_keeps_completion() -> None:
     assert messages[-1][2]["phase"] == "completed"
 
 
+def test_resume_acknowledges_intervention_responses_only_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FLOWAI_FAKE_CODEX", "1")
+    monkeypatch.setattr(codex_adapter, "FAKE_RESPONDER", schema_aware_responder)
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    session.project_path = tmp_path / "one-shot.flowai.json"
+    session.run_directory = tmp_path / "run"
+    session.run_directory.mkdir()
+    session.checkpoint = RunCheckpoint(started=True)
+    session.intervention_responses["result-1"] = {
+        "action": "continue_with_feedback",
+        "note": "Виправ лише один раз",
+    }
+
+    window.run_workflow(resume=True)
+
+    assert session.intervention_responses == {}
+    assert session.run_thread is not None
+    loop = QEventLoop()
+    session.run_thread.finished.connect(loop.quit)
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    QApplication.processEvents()
+    assert session.run_thread is None
+
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_acknowledging_old_response_preserves_a_newer_response() -> None:
+    session = WorkspaceSession(display_name="Flow", workflow=Workflow())
+    old_response = {"action": "continue"}
+    new_response = {"action": "force_branch", "branch": "true"}
+    session.intervention_responses["result-1"] = new_response
+
+    MainWindow._acknowledge_intervention_responses(
+        session, {"result-1": old_response}
+    )
+
+    assert session.intervention_responses == {"result-1": new_response}
+
+
 def test_agent_activity_does_not_rebuild_workspace_chrome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -284,6 +336,45 @@ def test_agent_activity_does_not_rebuild_workspace_chrome(
 
     assert sidebar_refreshes == []
     assert action_refreshes == []
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_a_long_log_never_rebuilds_the_whole_panel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application()
+    monkeypatch.setattr(main_window_module, "MAX_UI_LOG_ENTRIES", 50)
+    monkeypatch.setattr(main_window_module, "LOG_TRIM_SLACK", 10)
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    rebuilds: list[int] = []
+    appended: list[dict] = []
+    monkeypatch.setattr(
+        window.log_panel,
+        "render_entries",
+        lambda entries: rebuilds.append(len(entries)),
+    )
+    monkeypatch.setattr(window.log_panel, "append_entry", appended.append)
+
+    padding = "х" * 4_000
+    for index in range(400):
+        window._handle_run_event(
+            session.id,
+            {
+                "type": "agent_step",
+                "node_id": "node",
+                "message": f"{index} {padding}",
+            },
+        )
+
+    assert rebuilds == []
+    assert len(appended) == 400
+    assert appended[-1]["text"].startswith("node: 399 ")
+    assert len(session.log_entries) <= 60
     session.dirty = False
     window.dirty = False
     window.close()
@@ -337,7 +428,7 @@ def test_result_node_has_no_skill_field() -> None:
     window.close()
 
 
-def test_calibrator_node_has_no_output_ports() -> None:
+def test_calibrator_node_has_an_output_port() -> None:
     application()
     window = MainWindow(check_account_on_start=False, restore_workspaces=False)
     workflow = Workflow()
@@ -345,8 +436,29 @@ def test_calibrator_node_has_no_output_ports() -> None:
     workflow.nodes.append(node)
     window.scene.set_workflow(workflow)
     item = window.scene.node_items[node.id]
-    assert item.output_ports == {}
+    assert set(item.output_ports) == {"out"}
     assert item.input_port is not None
+    window.close()
+
+
+def test_calibrator_canvas_connection_targets_optimizer_input() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    workflow = Workflow()
+    optimizer = FlowNode.create("calibrator")
+    executor = FlowNode.create("executor")
+    workflow.nodes.extend([optimizer, executor])
+    window.scene.set_workflow(workflow)
+
+    created = window.scene._create_connection(
+        window.scene.node_items[optimizer.id],
+        "out",
+        window.scene.node_items[executor.id],
+    )
+
+    assert created is True
+    assert workflow.edges[0].source_path == "data.retry_context"
+    assert workflow.edges[0].target_variable == "prompt"
     window.close()
 
 
@@ -455,11 +567,13 @@ def test_main_toolbar_contains_settings_run_stop_files_and_account() -> None:
     assert window.settings_action not in toolbar_actions
     assert window.edit_flow_action not in toolbar_actions
     assert window.run_action not in toolbar_actions
+    assert window.pause_action not in toolbar_actions
     assert window.stop_action not in toolbar_actions
     assert window.files_action not in toolbar_actions
     assert window.settings_action.text() == "Settings"
     assert window.settings_action.icon().isNull() is False
     assert window.run_action.text() == "▶ Run"
+    assert window.pause_action.text() == "Ⅱ Pause"
     assert window.stop_action.text() == "■ Stop"
     assert window.files_action.text() == "Files"
     assert window.settings_button.defaultAction() is window.settings_action
@@ -470,9 +584,11 @@ def test_main_toolbar_contains_settings_run_stop_files_and_account() -> None:
     assert window.edit_flow_button.objectName() == "editFlowButton"
     assert window.edit_flow_action.icon().isNull() is False
     assert window.run_button.defaultAction() is window.run_action
+    assert window.pause_button.defaultAction() is window.pause_action
     assert window.stop_button.defaultAction() is window.stop_action
     assert window.files_button.defaultAction() is window.files_action
     assert window.run_button.objectName() == "runButton"
+    assert window.pause_button.objectName() == "pauseButton"
     assert window.stop_button.objectName() == "stopButton"
     assert window.files_button.objectName() == "filesButton"
     window.close()
@@ -544,9 +660,11 @@ def test_run_and_stop_actions_follow_the_selected_workspace() -> None:
     first = window.current_workspace
     assert first is not None
     first.run_thread = object()
+    first.run_worker = object()
     first.run_state = "running"
     window._update_workspace_actions()
     assert window.run_action.isEnabled() is False
+    assert window.pause_action.isEnabled() is True
     assert window.stop_action.isEnabled() is True
     assert window.files_action.isEnabled() is True
 
@@ -554,16 +672,151 @@ def test_run_and_stop_actions_follow_the_selected_workspace() -> None:
     second = window.current_workspace
     assert second is not None
     assert window.run_action.isEnabled() is True
-    assert window.stop_action.isEnabled() is False
+    assert window.pause_action.isEnabled() is False
+    assert window.stop_action.isEnabled() is True
 
     window.select_workspace(first.id)
     assert window.run_action.isEnabled() is False
+    assert window.pause_action.isEnabled() is True
     assert window.stop_action.isEnabled() is True
     first.run_thread = None
+    first.run_worker = None
     first.run_state = "idle"
     for session in window.workspace_sessions:
         session.dirty = False
     window.dirty = False
+    window.close()
+
+
+def test_pause_button_pauses_and_resumes_a_running_flow() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+
+    class WorkerStub:
+        def __init__(self) -> None:
+            self.pauses: list[str] = []
+            self.resumes: list[str] = []
+
+        def pause(self, reason: str) -> None:
+            self.pauses.append(reason)
+
+        def resume(self, reason: str) -> None:
+            self.resumes.append(reason)
+
+    worker = WorkerStub()
+    session.run_worker = worker
+    session.run_thread = object()
+    session.run_state = "running"
+
+    window.pause_workflow()
+
+    assert session.run_state == "paused"
+    assert worker.pauses == ["Flow призупинено користувачем"]
+    assert window.pause_action.text() == "▶ Resume"
+
+    window.pause_workflow()
+
+    assert session.run_state == "running"
+    assert worker.resumes == ["Flow продовжено користувачем"]
+    assert window.pause_action.text() == "Ⅱ Pause"
+    session.run_worker = None
+    session.run_thread = None
+    session.run_state = "idle"
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_attention_is_shown_as_pause_and_stop_is_available() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    session.run_state = "paused"
+    session.pending_intervention = {
+        "type": "result_confirmation",
+        "node_id": "result-1",
+    }
+
+    window._update_workspace_actions()
+
+    assert session.status_text == "Пауза — очікує на вашу відповідь"
+    assert "Attention" in window.pause_action.text()
+    assert window.pause_action.isEnabled() is True
+    assert window.stop_action.isEnabled() is True
+    session.pending_intervention = None
+    session.run_state = "idle"
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_stop_cancels_an_attention_paused_flow(tmp_path: Path, monkeypatch) -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    session.run_state = "paused"
+    session.pending_intervention = {
+        "type": "result_confirmation",
+        "node_id": "result-1",
+    }
+    session.run_directory = tmp_path / "run"
+    session.run_directory.mkdir(parents=True)
+    checkpoint_file = session.run_directory / "flowai-checkpoint.json"
+    checkpoint_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window.stop_workflow()
+
+    assert session.run_state == "stopped"
+    assert session.pending_intervention is None
+    assert checkpoint_file.exists() is True
+    assert window.stop_action.isEnabled() is True
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_close_preserves_attention_checkpoint_and_is_allowed(
+    tmp_path: Path,
+) -> None:
+    application()
+    window = MainWindow(
+        check_account_on_start=False, restore_workspaces=False, restore_layout=False
+    )
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    session.run_state = "paused"
+    session.pending_intervention = {
+        "type": "result_confirmation",
+        "node_id": "result-1",
+    }
+    session.run_directory = tmp_path / "run"
+    session.checkpoint = RunCheckpoint(started=True)
+    session.dirty = False
+    window.dirty = False
+    event = QCloseEvent()
+
+    window.closeEvent(event)
+
+    assert event.isAccepted() is True
+    checkpoint_file = session.run_directory / "flowai-checkpoint.json"
+    assert checkpoint_file.is_file()
+    saved = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+    assert saved["request"]["node_id"] == "result-1"
+    session.pending_intervention = None
+    session.run_state = "idle"
     window.close()
 
 
@@ -631,26 +884,28 @@ def test_system_lock_pauses_and_unlock_resumes_running_projects() -> None:
         display_name="Waiting",
         workflow=Workflow(),
         load_state="loaded",
-        run_state="needs_attention",
+        run_state="paused",
     )
+    waiting.pending_intervention = {"type": "result_confirmation"}
     waiting.run_worker = waiting_worker
     window.workspace_sessions.append(waiting)
 
     window._set_system_pause_reason("lock", True)
     assert session.run_state == "paused"
     assert len(worker.pauses) == 1
-    assert waiting.run_state == "needs_attention"
+    assert waiting.run_state == "paused"
     assert waiting_worker.pauses == []
     window._set_system_pause_reason("lock", False)
     assert session.run_state == "running"
     assert len(worker.resumes) == 1
-    assert waiting.run_state == "needs_attention"
+    assert waiting.run_state == "paused"
     assert waiting_worker.resumes == []
 
     session.run_worker = None
     session.run_thread = None
     session.run_state = "idle"
     waiting.run_worker = None
+    waiting.pending_intervention = None
     waiting.run_state = "idle"
     waiting.dirty = False
     session.dirty = False
@@ -658,7 +913,7 @@ def test_system_lock_pauses_and_unlock_resumes_running_projects() -> None:
     window.close()
 
 
-def test_close_is_blocked_while_any_project_is_running(monkeypatch) -> None:
+def test_close_requests_resumable_stop_for_every_running_project(monkeypatch) -> None:
     application()
     window = MainWindow(
         check_account_on_start=False, restore_workspaces=False, restore_layout=False
@@ -666,22 +921,35 @@ def test_close_is_blocked_while_any_project_is_running(monkeypatch) -> None:
     window.new_workflow()
     session = window.current_workspace
     assert session is not None
+    class Worker:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def request_stop(self, reason: str = "") -> None:
+            self.calls.append(reason)
+
+    worker = Worker()
     session.run_thread = object()
+    session.run_worker = worker
     session.run_state = "running"
-    warnings: list[tuple[str, str]] = []
     monkeypatch.setattr(
         QMessageBox,
-        "warning",
-        lambda _parent, title, message, *args: warnings.append((title, message)),
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
     )
 
     event = QCloseEvent()
     window.closeEvent(event)
 
     assert event.isAccepted() is False
-    assert warnings and session.display_name in warnings[0][1]
+    assert worker.calls and "збереженням progress" in worker.calls[0]
+    assert session.stop_pending is True
+    assert window._close_when_flows_stop is True
     session.run_thread = None
+    session.run_worker = None
     session.run_state = "idle"
+    session.stop_pending = False
+    window._close_when_flows_stop = False
     session.dirty = False
     window.dirty = False
     window.close()
@@ -845,6 +1113,12 @@ def test_workspace_card_separates_selection_and_run_status() -> None:
     assert selected.rail.property("state") == "selected"
     assert selected.status_icon.toolTip() == "Виконується"
 
+    session.run_state = "paused"
+    session.pending_intervention = {"type": "result_confirmation"}
+    attention = WorkspaceCard(session, selected=True)
+    assert attention.status_icon.text() == "Ⅱ"
+    assert "Пауза" in attention.status_icon.toolTip()
+
 
 def test_switching_workspaces_preserves_each_flow_state() -> None:
     application()
@@ -968,6 +1242,7 @@ def test_agent_prompt_event_keeps_large_text_out_of_the_ui_log() -> None:
         },
     )
 
+    window.log_panel.flush_log()
     visible = window.log_panel.view.toPlainText()
     assert "промпт сформовано; вкладень: 2" in visible
     assert "secret-instructions" not in visible
@@ -1255,9 +1530,7 @@ def test_tasks_node_keeps_seconds_in_states() -> None:
     scene = FlowScene()
     workflow = Workflow(name="Черга")
     manager = FlowNode.create("tasks_manager")
-    manager.config["tasks"] = [
-        {"id": "t1", "prompt": "Перше", "attachments": []}
-    ]
+    manager.config["tasks"] = [{"id": "t1", "prompt": "Перше", "attachments": []}]
     workflow.nodes = [manager]
     scene.set_workflow(workflow)
     scene.set_task_states(
@@ -1342,6 +1615,37 @@ def test_results_dialog_shows_final_files_only() -> None:
     ]
     dialog = ResultsDialog(session)
     assert dialog.result_paths() == ["C:/tmp/final.md"]
+    dialog.deleteLater()
+
+
+def test_results_dialog_renders_image_results_as_large_previews(
+    tmp_path: Path,
+) -> None:
+    application()
+    image_path = tmp_path / "final.png"
+    pixmap = QPixmap(640, 360)
+    pixmap.fill(Qt.GlobalColor.cyan)
+    assert pixmap.save(str(image_path))
+    session = WorkspaceSession(display_name="Тест")
+    session.generated_file_groups = [
+        {
+            "node_id": "n1",
+            "node_title": "Result",
+            "iteration": 1,
+            "color": "#7C3AED",
+            "intermediate": [],
+            "result": [str(image_path)],
+        }
+    ]
+
+    dialog = ResultsDialog(session)
+
+    assert dialog.gallery.paths == [str(image_path)]
+    assert len(dialog.gallery.previews) == 1
+    preview = dialog.gallery.previews[0].pixmap()
+    assert preview is not None
+    assert not preview.isNull()
+    assert preview.height() > 100
     dialog.deleteLater()
 
 
@@ -1530,6 +1834,40 @@ def test_main_window_tracks_each_node_runtime_separately() -> None:
     window.close()
 
 
+def test_attention_event_automatically_sets_the_flow_to_paused() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    result = next(node for node in window.scene.workflow.nodes if node.kind == "result")
+    session.run_state = "running"
+
+    window._handle_run_event(
+        session.id,
+        {
+            "type": "intervention_required",
+            "node_id": result.id,
+            "node_title": result.title,
+            "message": "Потрібне підтвердження",
+            "request": {
+                "type": "result_confirmation",
+                "node_id": result.id,
+            },
+        },
+    )
+
+    assert session.run_state == "paused"
+    assert session.pending_intervention is not None
+    assert "Attention" in window.pause_action.text()
+    assert window.stop_action.isEnabled() is True
+    session.pending_intervention = None
+    session.run_state = "idle"
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
 def test_node_console_messages_use_node_color_and_underline_files(
     tmp_path: Path,
 ) -> None:
@@ -1556,6 +1894,7 @@ def test_node_console_messages_use_node_color_and_underline_files(
         },
     )
 
+    window.log_panel.flush_log()
     plain = window.log_panel.view.toPlainText()
     assert f"{node.short_id}: готово" in plain
     assert "flowai-file:" in window.log_panel.view.toHtml()
@@ -1742,6 +2081,378 @@ def test_result_confirmation_dialog_returns_continue() -> None:
     dialog._accept()
     assert dialog.response == {"action": "continue"}
     dialog.close()
+
+
+def test_result_confirmation_dialog_close_dismisses_without_stopping(
+    tmp_path: Path,
+) -> None:
+    application()
+    image_path = tmp_path / "candidate.png"
+    pixmap = QPixmap(800, 450)
+    pixmap.fill(Qt.GlobalColor.green)
+    assert pixmap.save(str(image_path))
+    dialog = ResultConfirmationDialog(
+        {
+            "node_title": "Показати результат True/False",
+            "type": "result_confirmation",
+            "files": [str(image_path)],
+        }
+    )
+
+    assert dialog.gallery.paths == [str(image_path)]
+    assert len(dialog.gallery.previews) == 1
+    dialog.feedback.setPlainText("Не змінюй дах")
+    dialog.show()
+    dialog.close()
+    QApplication.processEvents()
+
+    assert dialog.response == {"action": "dismiss", "note": "Не змінюй дах"}
+    assert dialog.result() == QDialog.DialogCode.Rejected
+
+
+def test_result_confirmation_dialog_stop_is_explicit() -> None:
+    application()
+    dialog = ResultConfirmationDialog(
+        {"node_title": "Result", "type": "result_confirmation", "files": []}
+    )
+
+    dialog._stop()
+
+    assert dialog.response == {"action": "stop"}
+    assert dialog.result() == QDialog.DialogCode.Rejected
+
+
+def test_result_confirmation_shows_qa_and_can_send_user_feedback() -> None:
+    application()
+    dialog = ResultConfirmationDialog(
+        {
+            "node_title": "Показати результат",
+            "type": "result_confirmation",
+            "verdict": False,
+            "score": 72,
+            "reason": "Контур проходить через дерево",
+            "must_fix": ["Перемалювати E02", "Не зачіпати дах"],
+            "user_requirements": [
+                "Теплиця разом із рослинами є однією групою"
+            ],
+            "feedback_target_title": "Виправити зображення",
+            "files": [],
+        }
+    )
+
+    assert "FALSE" in dialog.verdict_badge.text()
+    assert "72" in dialog.score_label.text()
+    assert "Контур проходить через дерево" in dialog.qa_details.toPlainText()
+    assert "Перемалювати E02" in dialog.qa_details.toPlainText()
+    assert "мають пріоритет над QA" in dialog.user_requirements_label.text()
+    assert (
+        "Теплиця разом із рослинами є однією групою"
+        in dialog.user_requirements.toPlainText()
+    )
+    assert dialog.send_feedback_button.isEnabled() is False
+
+    dialog.feedback.setPlainText("Збережи дах і виправ лише E02")
+    assert dialog.send_feedback_button.isEnabled() is True
+    dialog._send_feedback()
+
+    assert dialog.response == {
+        "action": "continue_with_feedback",
+        "note": "Збережи дах і виправ лише E02",
+    }
+
+
+def test_result_confirmation_can_open_grill_with_draft_feedback() -> None:
+    application()
+    dialog = ResultConfirmationDialog(
+        {
+            "node_title": "Result",
+            "type": "result_confirmation",
+            "verdict": False,
+            "files": [],
+        }
+    )
+    dialog.feedback.setPlainText("Не впевнений щодо даху")
+
+    dialog._grill()
+
+    assert dialog.response == {
+        "action": "grill",
+        "note": "Не впевнений щодо даху",
+    }
+
+
+def test_result_confirmation_restores_saved_feedback_draft() -> None:
+    application()
+    dialog = ResultConfirmationDialog(
+        {
+            "node_title": "Result",
+            "type": "result_confirmation",
+            "feedback_draft": "Чернетка, яку не можна втратити",
+            "files": [],
+        }
+    )
+
+    assert dialog.feedback.toPlainText() == "Чернетка, яку не можна втратити"
+    assert dialog.send_feedback_button.isEnabled() is True
+    dialog.close()
+
+
+def test_grilled_result_feedback_is_sent_and_resumes_flow(
+    monkeypatch, tmp_path: Path
+) -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None and session.workflow is not None
+    result_node = next(node for node in session.workflow.nodes if node.kind == "result")
+    request = {
+        "type": "result_confirmation",
+        "node_id": result_node.id,
+        "node_title": result_node.title,
+        "verdict": False,
+        "reason": "Контур неточний",
+        "must_fix": ["Перемалювати контур"],
+        "files": [],
+    }
+    session.run_state = "needs_attention"
+    session.pending_intervention = request
+    session.run_directory = tmp_path / "run"
+    session.checkpoint = RunCheckpoint(started=True)
+    resumed: list[bool] = []
+
+    class GrillDialogStub:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            assert kwargs["review_feedback"]["user_note"] == "Не змінювати дах"
+            self.outcome = GrillOutcome(
+                summary="Контур виправляємо, дах зберігаємо",
+                feedback="Перемалюй контур; дах не змінюй",
+            )
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module, "GrillDialog", GrillDialogStub)
+    monkeypatch.setattr(
+        window, "run_workflow", lambda *, resume=False: resumed.append(resume)
+    )
+
+    window._discuss_result_feedback(
+        session, request, result_node.id, "Не змінювати дах"
+    )
+
+    assert session.intervention_responses[result_node.id] == {
+        "action": "continue_with_feedback",
+        "note": "Перемалюй контур; дах не змінюй",
+    }
+    assert session.pending_intervention is None
+    assert resumed == [True]
+    record = Path(str(request["grill_record_path"]))
+    assert record.is_file()
+    record_text = record.read_text(encoding="utf-8")
+    assert "Стан: completed" in record_text
+    assert "Не змінювати дах" in record_text
+    assert "Перемалюй контур; дах не змінюй" in record_text
+    saved = json.loads(
+        (session.run_directory / "flowai-checkpoint.json").read_text(encoding="utf-8")
+    )
+    assert saved["request"]["grill_feedback"] == ("Перемалюй контур; дах не змінюй")
+    session.run_state = "idle"
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_cancelled_grill_preserves_draft_and_checkpoint(
+    monkeypatch, tmp_path: Path
+) -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None and session.workflow is not None
+    result_node = next(node for node in session.workflow.nodes if node.kind == "result")
+    request = {
+        "type": "result_confirmation",
+        "node_id": result_node.id,
+        "node_title": result_node.title,
+        "verdict": False,
+        "files": [],
+    }
+    session.run_state = "needs_attention"
+    session.pending_intervention = request
+    session.run_directory = tmp_path / "run"
+    session.checkpoint = RunCheckpoint(started=True)
+
+    class GrillDialogStub:
+        outcome = None
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(main_window_module, "GrillDialog", GrillDialogStub)
+
+    window._discuss_result_feedback(
+        session, request, result_node.id, "Збережи мою чернетку"
+    )
+
+    assert session.pending_intervention is request
+    assert request["feedback_draft"] == "Збережи мою чернетку"
+    restored = ResultConfirmationDialog(request)
+    assert restored.feedback.toPlainText() == "Збережи мою чернетку"
+    restored.close()
+    saved = json.loads(
+        (session.run_directory / "flowai-checkpoint.json").read_text(encoding="utf-8")
+    )
+    assert saved["request"]["feedback_draft"] == "Збережи мою чернетку"
+    assert saved["request"]["grill_state"] == "cancelled"
+    session.run_state = "idle"
+    session.pending_intervention = None
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_result_grill_is_deferred_until_result_dialog_unwinds(monkeypatch) -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    result_node = next(
+        node for node in window.scene.workflow.nodes if node.kind == "result"
+    )
+    request = {
+        "type": "result_confirmation",
+        "node_id": result_node.id,
+        "node_title": result_node.title,
+        "files": [],
+    }
+    session.run_state = "needs_attention"
+    session.pending_intervention = request
+    scheduled: list[object] = []
+    discussed: list[str] = []
+
+    class ResultDialogStub:
+        def __init__(self, request: dict, parent: object) -> None:
+            self.response = {"action": "grill", "note": "Моя правка"}
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+    class TimerStub:
+        @staticmethod
+        def singleShot(delay: int, callback: object) -> None:
+            assert delay == 0
+            scheduled.append(callback)
+
+    monkeypatch.setattr(
+        main_window_module, "ResultConfirmationDialog", ResultDialogStub
+    )
+    monkeypatch.setattr(main_window_module, "QTimer", TimerStub)
+    monkeypatch.setattr(
+        window,
+        "_discuss_result_feedback",
+        lambda _session, _request, _node_id, note: discussed.append(note),
+    )
+
+    window._show_pending_intervention(user_initiated=True)
+
+    assert discussed == []
+    assert len(scheduled) == 1
+    scheduled[0]()
+    assert discussed == ["Моя правка"]
+    session.run_state = "idle"
+    session.pending_intervention = None
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_dismissed_result_confirmation_can_be_opened_again(monkeypatch) -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    result_node = next(
+        node for node in window.scene.workflow.nodes if node.kind == "result"
+    )
+    session.run_state = "needs_attention"
+    session.pending_intervention = {
+        "type": "result_confirmation",
+        "node_id": result_node.id,
+        "node_title": result_node.title,
+        "files": [],
+    }
+    opened: list[str] = []
+
+    class DismissDialog:
+        def __init__(self, request: dict, parent: object) -> None:
+            opened.append(str(request["node_id"]))
+            self.response = {"action": "dismiss"}
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(main_window_module, "ResultConfirmationDialog", DismissDialog)
+
+    window._show_pending_intervention()
+    window._show_pending_intervention(user_initiated=True)
+
+    assert opened == [result_node.id, result_node.id]
+    assert session.run_state == "paused"
+    assert session.pending_intervention is not None
+    assert window.scene.node_items[result_node.id].attention is True
+    session.run_state = "idle"
+    session.pending_intervention = None
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_reference_cache_attention_opens_the_retry_dialog(monkeypatch) -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    node = window.scene.workflow.nodes[0]
+    session.run_state = "needs_attention"
+    session.pending_intervention = {
+        "type": "reference_analysis_attention",
+        "node_id": node.id,
+        "node_title": node.title,
+        "reason": "Набір UI-референсів змінився",
+        "files": [],
+    }
+    opened: list[str] = []
+
+    class DismissAttentionDialog:
+        def __init__(self, request: dict, parent: object) -> None:
+            opened.append(str(request["type"]))
+            self.response = {"action": "dismiss"}
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(
+        main_window_module, "RetryAttentionDialog", DismissAttentionDialog
+    )
+
+    window._show_pending_intervention(user_initiated=True)
+
+    assert opened == ["reference_analysis_attention"]
+    assert session.run_state == "paused"
+    assert session.pending_intervention is not None
+    session.run_state = "idle"
+    session.pending_intervention = None
+    session.dirty = False
+    window.dirty = False
+    window.close()
 
 
 def test_inspector_shows_only_the_fields_of_the_selected_kind() -> None:
@@ -1961,6 +2672,274 @@ def test_active_edge_animates_dashes() -> None:
     scene.set_active_edge(edge.id)
     assert item.is_active is True
     assert scene._running_timer.isActive()
+
+
+def loop_workflow() -> tuple[Workflow, dict[str, FlowNode], dict[str, FlowEdge]]:
+    """tasks_manager → executor → result, з поверненнями по true і false."""
+    manager = FlowNode.create("tasks_manager")
+    executor = FlowNode.create("executor")
+    verdict = FlowNode.create("result")
+    workflow = Workflow(name="Цикл")
+    workflow.nodes = [manager, executor, verdict]
+    edges = {
+        "next": FlowEdge.create(manager.id, executor.id, "next"),
+        "out": FlowEdge.create(executor.id, verdict.id),
+        "false": FlowEdge.create(verdict.id, executor.id, "false"),
+        "true": FlowEdge.create(verdict.id, manager.id, "true"),
+    }
+    workflow.edges = list(edges.values())
+    nodes = {"manager": manager, "executor": executor, "verdict": verdict}
+    return workflow, nodes, edges
+
+
+def finished_event(node: FlowNode, branch: str) -> dict:
+    return {
+        "type": "node_finished",
+        "node_id": node.id,
+        "node_title": node.title,
+        "result": {
+            "status": "success",
+            "text": "",
+            "duration_seconds": 1.0,
+            "data": {"branch": branch},
+        },
+    }
+
+
+def started_event(node: FlowNode) -> dict:
+    return {
+        "type": "node_started",
+        "node_id": node.id,
+        "node_title": node.title,
+        "iteration": 1,
+    }
+
+
+def active_edge_id(window: MainWindow) -> str:
+    return next(
+        (
+            identifier
+            for identifier, item in window.scene.edge_items.items()
+            if item.is_active
+        ),
+        "",
+    )
+
+
+def test_the_lit_edge_follows_the_port_that_actually_fired() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    workflow, nodes, edges = loop_workflow()
+    session.workflow = workflow
+    window.scene.set_workflow(workflow)
+
+    window._handle_run_event(session.id, finished_event(nodes["verdict"], "false"))
+    window._handle_run_event(session.id, started_event(nodes["executor"]))
+    assert active_edge_id(window) == edges["false"].id
+
+    window._handle_run_event(session.id, finished_event(nodes["verdict"], "true"))
+    window._handle_run_event(session.id, started_event(nodes["manager"]))
+    assert active_edge_id(window) == edges["true"].id
+
+    # Після true керування йде через tasks_manager, а не назад по false.
+    window._handle_run_event(session.id, finished_event(nodes["manager"], "next"))
+    window._handle_run_event(session.id, started_event(nodes["executor"]))
+    assert active_edge_id(window) == edges["next"].id
+
+    session.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_task_list_survives_leaving_and_returning_to_a_workspace() -> None:
+    application()
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    window.new_workflow()
+    session = window.current_workspace
+    assert session is not None
+    workflow, nodes, _ = loop_workflow()
+    session.workflow = workflow
+    window.scene.set_workflow(workflow)
+    manager = nodes["manager"]
+
+    window._handle_run_event(
+        session.id,
+        {
+            "type": "tasks_progress",
+            "node_id": manager.id,
+            "node_title": manager.title,
+            "message": "Активовано: Друге",
+            "task_states": [
+                {"id": "t1", "title": "Перше", "status": "completed", "seconds": 3.0},
+                {"id": "t2", "title": "Друге", "status": "running", "seconds": 1.0},
+            ],
+            "completed_count": 1,
+            "task_count": 2,
+            "total_seconds": 4.0,
+        },
+    )
+    assert window.scene.node_items[manager.id].has_active_task() is True
+
+    window.new_workflow()
+    window.select_workspace(session.id)
+
+    item = window.scene.node_items[manager.id]
+    assert [str(task["status"]) for task in item.task_states] == [
+        "completed",
+        "running",
+    ]
+    assert item.has_active_task() is True
+
+    for candidate in window.workspace_sessions:
+        candidate.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_a_restored_run_shows_finished_and_active_tasks(tmp_path: Path) -> None:
+    application()
+    manager = FlowNode.create("tasks_manager")
+    manager.config["tasks"] = [
+        {"id": "t1", "prompt": "Перше завдання"},
+        {"id": "t2", "prompt": "Друге завдання"},
+        {"id": "t3", "prompt": "Третє завдання"},
+    ]
+    executor = FlowNode.create("executor")
+    workflow = Workflow(name="Відновлення")
+    workflow.nodes = [manager, executor]
+    workflow.edges = [FlowEdge.create(manager.id, executor.id, "next")]
+    project = save_workflow(workflow, tmp_path / "flow.flowai.json")
+
+    checkpoint = RunCheckpoint()
+    checkpoint.started = True
+    checkpoint.task_progress[manager.id] = {
+        "active_task_id": "t2",
+        "completed_task_ids": ["t1"],
+        "failed_task_ids": [],
+        "times": {"t1": {"started": 0.0, "finished": 5.0, "seconds": 5.0}},
+    }
+    checkpoint.outputs[manager.id] = {
+        "node_id": manager.id,
+        "status": "success",
+        "duration_seconds": 2.0,
+        "data": {"branch": "next"},
+    }
+    checkpoint.port_counts[f"{manager.id}:next"] = 1
+    save_checkpoint(
+        tmp_path / "runs" / "20260823-120000-000000",
+        checkpoint,
+        project_path=project,
+        request={"node_id": executor.id, "type": "result_confirmation"},
+    )
+
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    session = WorkspaceSession(display_name="Відновлення", project_path=project)
+    window.workspace_sessions.append(session)
+    assert window._load_workspace_session(session) is True
+    window.select_workspace(session.id)
+
+    assert session.checkpoint is not None
+    item = window.scene.node_items[manager.id]
+    assert [str(task["status"]) for task in item.task_states] == [
+        "completed",
+        "running",
+        "pending",
+    ]
+    assert item.has_active_task() is True
+    assert session.node_statuses.get(manager.id) == "success"
+    assert session.port_counts.get(f"{manager.id}:next") == 1
+
+    # select_workspace ставить у чергу модальний діалог втручання; знімаємо
+    # його, інакше він відкриється у наступному тесті й заблокує процес.
+    session.pending_intervention = None
+    session.run_state = "idle"
+    for candidate in window.workspace_sessions:
+        candidate.dirty = False
+    window.dirty = False
+    window.close()
+
+
+def test_recover_progress_action_builds_checkpoint_without_starting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    application()
+    manager = FlowNode.create("tasks_manager")
+    manager.config["tasks"] = [
+        {"id": "t1", "prompt": "Перше"},
+        {"id": "t2", "prompt": "Друге"},
+    ]
+    executor = FlowNode.create("executor")
+    workflow = Workflow(
+        name="Recovery action",
+        nodes=[manager, executor],
+        edges=[FlowEdge.create(manager.id, executor.id, "next")],
+    )
+    project = save_workflow(workflow, tmp_path / "flow.flowai.json")
+    run_directory = tmp_path / "runs" / "20260825-120000-000000"
+    run_directory.mkdir(parents=True)
+    (run_directory / "flowai-run.json").write_text(
+        json.dumps(
+            {
+                "status": "cancelled",
+                "events": [
+                    {
+                        "type": "tasks_progress",
+                        "node_id": manager.id,
+                        "active_task_id": "t2",
+                        "task_states": [
+                            {"id": "t1", "status": "completed"},
+                            {"id": "t2", "status": "running"},
+                        ],
+                    },
+                    {
+                        "type": "node_started",
+                        "node_id": executor.id,
+                        "inputs": {"prompt": {"task_id": "t2"}},
+                    },
+                    {
+                        "type": "node_cancelled",
+                        "node_id": executor.id,
+                        "result": {"status": "cancelled", "data": {}},
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window = MainWindow(check_account_on_start=False, restore_workspaces=False)
+    session = WorkspaceSession(display_name="Recovery", project_path=project)
+    window.workspace_sessions.append(session)
+    assert window._load_workspace_session(session) is True
+    window.select_workspace(session.id)
+
+    window.recover_progress_from_last_run()
+
+    assert session.run_state == "stopped"
+    assert session.run_thread is None
+    assert session.checkpoint.active_node_id == executor.id
+    assert session.node_statuses[executor.id] == "waiting"
+    assert session.checkpoint.task_progress[manager.id]["completed_task_ids"] == [
+        "t1"
+    ]
+    assert (run_directory / "flowai-checkpoint.json").is_file()
+    recovered = list(
+        (tmp_path / ".flowai" / "runtime" / "checkpoints").glob(
+            "recovered-*.json"
+        )
+    )
+    assert len(recovered) == 1
+    session.dirty = False
+    window.dirty = False
+    window.close()
 
 
 def test_parameters_combo_and_spin_ignore_mouse_wheel() -> None:

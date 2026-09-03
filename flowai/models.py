@@ -55,7 +55,7 @@ AGENT_KINDS = frozenset(
 SIDECAR_KINDS = frozenset({"work_reviewer"})
 
 # Ноди з входом, але без виходів: маршрут на них закінчується.
-TERMINAL_KINDS = frozenset({"calibrator"})
+TERMINAL_KINDS: frozenset[str] = frozenset()
 
 # Ці ноди ніколи не стартують Flow самостійно.
 NEVER_SEEDED = frozenset({"calibrator"})
@@ -72,9 +72,32 @@ PROMPT_REVIEW_SCHEMA: dict[str, Any] = {
 
 TASK_REVIEW_SCHEMA: dict[str, Any] = {
     "verdict": True,
-    "score": 0,
+    "score": 100,
+    "pass_threshold": 80,
     "reason": "string",
+    "issues": [
+        {
+            "defect_id": "stable-id",
+            "category": "visual_preference|visual_mismatch|technical_blocker|missing_requirement",
+            "severity": "info|warning|blocking",
+            "description": "string",
+            "target_files": ["string"],
+            "target_regions": [{"id": "string", "x": 0, "y": 0, "w": 0, "h": 0}],
+            "rule_id": "stable-machine-rule",
+            "must_fix": "string",
+        }
+    ],
     "must_fix": ["string"],
+    "evidence_files": ["string"],
+    "checks": [
+        {
+            "check_id": "stable-check-id",
+            "status": "pass|fail",
+            "target_files": ["string"],
+            "evidence_files": ["string"],
+        }
+    ],
+    "system_error": None,
 }
 
 
@@ -93,9 +116,16 @@ def _agent_defaults(**overrides: Any) -> dict[str, Any]:
         "output_schema": {},
         "attachments": [],
         "skills": [],
-        "timeout_seconds": 1800,
+        # timeout_seconds тут колись був, але рушій його не читав ніколи.
+        # Довгу роботу зупиняє користувач, а не таймер, тож поле прибрано,
+        # щоб настройка не обіцяла поведінки, якої немає.
         "retries": 0,
         "memory": "thread",
+        "context_soft_limit": 80_000,
+        "prompt_cache_enabled": False,
+        "qa_cache_enabled": False,
+        "deterministic_qa_enabled": False,
+        "read_only_audit": True,
     }
     base.update(overrides)
     return base
@@ -118,19 +148,39 @@ def normalize_managed_tasks(raw: Any) -> list[dict[str, Any]]:
         task_id = str(item.get("id") or uuid4().hex)
         if any(existing["id"] == task_id for existing in tasks):
             task_id = uuid4().hex
-        tasks.append(
+        task = dict(item)
+        task.update(
             {
                 "id": task_id,
+                "title": str(item.get("title", "")),
                 "prompt": str(item.get("prompt", "")),
+                "screen": str(item.get("screen", "")),
+                "states": [
+                    str(state)
+                    for state in item.get("states", [])
+                    if str(state)
+                ],
+                "acceptance_criteria": [
+                    str(rule)
+                    for rule in item.get("acceptance_criteria", [])
+                    if str(rule)
+                ],
                 "attachments": [
                     str(path) for path in item.get("attachments", []) if str(path)
                 ],
+                "export_profile": str(
+                    item.get("export_profile") or "baseline"
+                ),
             }
         )
+        tasks.append(task)
     return tasks or [new_managed_task()]
 
 
 def managed_task_title(task: dict[str, Any], index: int) -> str:
+    configured = str(task.get("title") or "").strip()
+    if configured:
+        return configured[:54]
     first_line = next(
         (
             line.strip()
@@ -142,6 +192,45 @@ def managed_task_title(task: dict[str, Any], index: int) -> str:
     return first_line[:54] or f"Завдання {index + 1}"
 
 
+def task_states_from_progress(
+    tasks: list[dict[str, Any]], progress: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Показові стани завдань зі збереженого прогресу, нічого не змінюючи.
+
+    Рушій рахує те саме по ходу запуску; ця функція потрібна, щоб підняти
+    картинку з чекпоінта після перезапуску FlowAI.
+    """
+    failed = {str(item) for item in progress.get("failed_task_ids", [])}
+    completed = {
+        str(item)
+        for item in progress.get("completed_task_ids", [])
+        if str(item) not in failed
+    }
+    active_id = str(progress.get("active_task_id", ""))
+    times = progress.get("times") or {}
+    states: list[dict[str, Any]] = []
+    for index, task in enumerate(tasks):
+        task_id = str(task["id"])
+        record = times.get(task_id) or {}
+        states.append(
+            {
+                "id": task_id,
+                "title": managed_task_title(task, index),
+                "status": (
+                    "failed"
+                    if task_id in failed
+                    else "completed"
+                    if task_id in completed
+                    else "running"
+                    if task_id == active_id
+                    else "pending"
+                ),
+                "seconds": round(float(record.get("seconds", 0.0) or 0.0), 3),
+            }
+        )
+    return states
+
+
 def _default_config(kind: str) -> dict[str, Any]:
     defaults: dict[str, dict[str, Any]] = {
         "entry": {
@@ -149,12 +238,20 @@ def _default_config(kind: str) -> dict[str, Any]:
             "json": {},
             "attachments": [],
         },
-        "tasks_manager": {"tasks": [new_managed_task()]},
+        "tasks_manager": {
+            "tasks": [new_managed_task()],
+            "task_source": "static",
+            "plan_save_path": "ui_project_spec.json",
+        },
         "prompt_reviewer": _agent_defaults(
             instructions=(
                 "Ти покращуєш вхідний промпт перед тим, як його виконає інший агент. "
                 "Врахуй, через які блоки пройде задача далі, і зроби промпт "
-                "однозначним, перевірюваним і достатнім для виконання."
+                "однозначним, перевірюваним і достатнім для виконання. Якщо "
+                "Flow передав trusted receipt попереднього Result TRUE, не "
+                "перетворюй старий pre-confirmation marker на неможливу стартову "
+                "умову й не доручай агенту редагувати progress: state transition "
+                "належить рушію."
             ),
             prompt=(
                 "# Промпт користувача\n{{entry_prompt}}\n\n"
@@ -167,20 +264,42 @@ def _default_config(kind: str) -> dict[str, Any]:
             output_format="json",
             output_schema=dict(PROMPT_REVIEW_SCHEMA),
             sandbox="read-only",
+            compact_flow_context=True,
+            prompt_cache_enabled=True,
         ),
         "executor": _agent_defaults(
             instructions=(
                 "Виконай поставлену задачу повністю. Якщо тобі повертають задачу на "
-                "переробку, виправ саме те, що вказав рев'ювер, і не зламай решту."
+                "переробку, виправ саме те, що вказав рев'ювер, і не зламай решту. "
+                "Trusted receipt попереднього Result TRUE є системним доказом "
+                "переходу. Не редагуй статус проходження вручну: його атомарно "
+                "оновлює FlowAI; у разі суперечності поверни engine_state blocker."
             ),
             prompt="{{prompt}}",
             prompt_source="input",
+            # Generic/legacy executors keep one node thread. Flows with a
+            # Tasks Manager opt into task_thread explicitly so tasks cannot
+            # contaminate each other's context.
+            memory="thread",
+            operation_policy={
+                "max_iterations": 500,
+                "no_improvement_patience": 50,
+                "min_delta": 0.0001,
+                "checkpoint_every": 10,
+            },
+            operation_intent_required=False,
+            legacy_retry_upgrade_enabled=False,
+            legacy_retry_protected_checks=[],
+            legacy_retry_protected_files=[],
         ),
         "task_reviewer": _agent_defaults(
             instructions=(
                 "Ти перевіряєш, чи виконана робота задовольняє поставленій задачі. "
                 "Будь конкретним: якщо відхиляєш, must_fix має містити дії, "
-                "а не загальні побажання."
+                "а не загальні побажання. Trusted receipt підтверджує тільки "
+                "завершення попереднього task; не відхиляй поточний результат "
+                "лише через старий pre-confirmation marker, якщо receipt містить "
+                "успішний state patch. QA ніколи не редагує файли."
             ),
             prompt=(
                 "# Задача, відносно якої перевіряємо\n{{criteria}}\n\n"
@@ -191,6 +310,11 @@ def _default_config(kind: str) -> dict[str, Any]:
             output_schema=dict(TASK_REVIEW_SCHEMA),
             sandbox="read-only",
             criteria_node="",
+            strict_review_contract=True,
+            pass_threshold=80,
+            qa_correction_attempts=1,
+            qa_cache_enabled=True,
+            deterministic_qa_enabled=True,
         ),
         "result": {
             "template": "{{work}}",
@@ -199,6 +323,15 @@ def _default_config(kind: str) -> dict[str, Any]:
             "false_limit": 3,
             "task_attempt_limit": 2,
             "wait_for_confirmation": False,
+            "confirmation_mode": "standard",
+            "confirmation_ports": ["true", "false"],
+            "final_task_result": True,
+            "retry_guard_enabled": False,
+            "retry_guard_threshold": 2,
+            "regression_threshold": 1,
+            "retry_contract_enabled": True,
+            "transition_adapter": {},
+            "learning_enabled": False,
         },
         "work_reviewer": _agent_defaults(
             instructions=(
@@ -215,6 +348,10 @@ def _default_config(kind: str) -> dict[str, Any]:
             monitor_all=True,
             monitored_nodes=[],
             report_path="",
+            review_triggers=["run_finished"],
+            learning_log_path="learnings/ui_learnings.jsonl",
+            project_profile_path="learnings/ui_project_profile.md",
+            skill_proposals_path="learnings/skill-proposals",
         ),
         "calibrator": _agent_defaults(
             instructions=(
@@ -225,6 +362,10 @@ def _default_config(kind: str) -> dict[str, Any]:
                 "текст скіла або промпт. У before клади ТОЧНИЙ фрагмент, "
                 "який зараз є у файлі, інакше правку неможливо застосувати. "
                 "Не чіпай scripts/ і assets/ скілів."
+                " Спочатку класифікуй root_cause_category як artifact, "
+                "agent_strategy, engine_state або tool_failure. Для engine_state "
+                "не маскуй дефект новими prompt-правилами й не пропонуй edits: "
+                "поверни системну рекомендацію для Attention."
             ),
             prompt=(
                 "# Скіли, які агент справді відкривав\n{{skills_used}}\n\n"
@@ -240,7 +381,9 @@ def _default_config(kind: str) -> dict[str, Any]:
             output_format="json",
             output_schema=dict(CALIBRATION_SCHEMA),
             memory="thread",
-            false_threshold=1,
+            false_threshold=2,
+            auto_skip=False,
+            reviewed_nodes=[],
             thread_source="",
             reviewer_node="",
         ),
@@ -290,8 +433,24 @@ class FlowNode:
                 f"Тип ноди «{kind}» більше не підтримується. "
                 "Цей Flow створено у форматі 1 — створіть його заново."
             )
+        supplied = dict(raw.get("config") or {})
         config = _default_config(kind)
-        config.update(raw.get("config") or {})
+        config.update(supplied)
+        if kind == "task_reviewer":
+            # Старі Flow зберігали коротку schema без issues/checks. Додаємо
+            # нові поля, не стираючи власних назв і додаткових полів користувача.
+            schema = dict(TASK_REVIEW_SCHEMA)
+            raw_schema = supplied.get("output_schema")
+            if isinstance(raw_schema, dict):
+                schema.update(raw_schema)
+            config["output_schema"] = schema
+            # Нові ноди строгі одразу. Старі ноди лишаються сумісними, доки
+            # користувач або цільова міграція явно не увімкне контракт.
+            if "strict_review_contract" not in supplied:
+                config["strict_review_contract"] = False
+        # Ретирована настройка: рушій не читав її ніколи, тож зі старих Flow
+        # її теж прибираємо, щоб вона не виглядала робочою.
+        config.pop("timeout_seconds", None)
         if kind == "tasks_manager":
             config["tasks"] = normalize_managed_tasks(config.get("tasks"))
         return cls(
@@ -502,6 +661,17 @@ class Workflow:
                     "лише з виходом FALSE блока Result"
                 )
 
+        for edge in self.edges:
+            source = self.find(edge.source)
+            if source is None or source.kind != "calibrator":
+                continue
+            target = self.find(edge.target)
+            if target is None or target.kind != "executor":
+                errors.append(
+                    f"Вихід блока «{source.title}» (Calibration Stop) можна "
+                    "з'єднати лише з блоком Executor"
+                )
+
         for node in self.nodes_of_kind("result"):
             attached = [
                 edge.target
@@ -514,17 +684,28 @@ class Workflow:
                     f"До блока «{node.title}» можна підключити "
                     "лише один Calibration Stop"
                 )
+            if attached and any(
+                (target := self.find(edge.target)) is not None
+                and target.kind == "executor"
+                for edge in self.outgoing(node.id, "false")
+            ):
+                errors.append(
+                    f"Блок «{node.title}» не повинен вести напряму в Executor, "
+                    "коли до FALSE підключено Calibration Stop. Використайте "
+                    "маршрут Result.FALSE → Calibration Stop → Executor"
+                )
 
         if len(self.nodes_of_kind("work_reviewer")) > 1:
             errors.append("У Flow може бути лише один блок Work Reviewer")
 
         for node in self.nodes_of_kind("tasks_manager"):
             tasks = normalize_managed_tasks(node.config.get("tasks"))
-            for index, task in enumerate(tasks):
-                if not str(task.get("prompt", "")).strip():
-                    errors.append(
-                        f"У блоці «{node.title}» завдання {index + 1} не має промпту"
-                    )
+            if str(node.config.get("task_source") or "static") != "input_once":
+                for index, task in enumerate(tasks):
+                    if not str(task.get("prompt", "")).strip():
+                        errors.append(
+                            f"У блоці «{node.title}» завдання {index + 1} не має промпту"
+                        )
             if not self.outgoing(node.id, "next"):
                 errors.append(f"Блок «{node.title}» потребує з'єднання з виходу NEXT")
             has_result_return = any(
@@ -593,6 +774,19 @@ class Workflow:
             indegree[edge.target] += 1
 
         ready = [node_id for node_id in ids if indegree[node_id] == 0]
+        # Calibration Stop is never seeded into the initial queue, but after a
+        # Result.FALSE it must run before the retry branch.  Keeping it first in
+        # the runtime topological order makes that guarantee independent of the
+        # order in which nodes happen to be stored in the Flow JSON.
+        ready.sort(
+            key=lambda node_id: (
+                0
+                if (node := self.find(node_id)) is not None
+                and node.kind == "calibrator"
+                else 1,
+                ids.index(node_id),
+            )
+        )
         ordered: list[str] = []
         while ready:
             node_id = ready.pop(0)

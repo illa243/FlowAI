@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..codex_auth import CodexUser, read_codex_user_from_client
+from ..codex_process import create_codex
 from .motion import AnimatedDialog
 
 LOGGER = logging.getLogger(__name__)
@@ -35,9 +36,9 @@ class LoginWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            from openai_codex import Codex
+            import openai_codex
 
-            with Codex() as codex:
+            with create_codex(codex_module=openai_codex) as codex:
                 if self._cancel_requested.is_set():
                     self.cancelled.emit()
                     return

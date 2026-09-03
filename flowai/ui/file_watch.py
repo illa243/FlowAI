@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterator
 from pathlib import Path
 
 from PySide6.QtCore import QFileSystemWatcher, QObject, QTimer, Signal
@@ -13,27 +12,37 @@ IGNORED_PARTS = frozenset(
     {
         ".git",
         ".venv",
+        ".uv",
+        ".uv-cache",
         ".ruff_cache",
         ".pytest_cache",
+        ".mypy_cache",
         "__pycache__",
         "node_modules",
         "runs",
     }
 )
+IGNORED_SUFFIXES = frozenset({".tmp", ".part", ".lock"})
 MAX_SIZE_BYTES = 64 * 1024 * 1024
 MAX_WATCHED_DIRECTORIES = 400
-RESCAN_INTERVAL_MS = 900
+# Сторож живе в головному потоці Qt. Проміжні результати не потребують
+# реакції за частки секунди, а кожне сканування відбирає час у інтерфейсу.
+RESCAN_INTERVAL_MS = 2000
+
+
+def _ignored_name(name: str) -> bool:
+    return name.casefold() in IGNORED_PARTS
+
+
+def _ignored_file_name(name: str) -> bool:
+    return name.startswith("~") or Path(name).suffix.casefold() in IGNORED_SUFFIXES
 
 
 def is_interesting(path: Path) -> bool:
     """Return whether a path may be shown as an intermediate result."""
-    if any(part.casefold() in IGNORED_PARTS for part in path.parts):
+    if any(_ignored_name(part) for part in path.parts):
         return False
-    if path.name.startswith("~") or path.suffix.casefold() in {
-        ".tmp",
-        ".part",
-        ".lock",
-    }:
+    if _ignored_file_name(path.name):
         return False
     try:
         if path.is_file() and path.stat().st_size > MAX_SIZE_BYTES:
@@ -43,12 +52,42 @@ def is_interesting(path: Path) -> bool:
     return True
 
 
-def _walk(root: Path) -> Iterator[tuple[Path, list[Path]]]:
-    """Walk a root while pruning service directories before descending."""
-    for directory, names, files in os.walk(root, onerror=lambda error: None):
-        base = Path(directory)
-        names[:] = [name for name in names if is_interesting(base / name)]
-        yield base, [base / name for name in files]
+def scan(root: Path) -> tuple[list[Path], list[Path]]:
+    """Обійти теку один раз і повернути (теки, файли).
+
+    Раніше сторож ходив по дереву двічі — окремо заради нових тек і окремо
+    заради нових файлів — і на кожному файлі робив зайвий `stat`. `DirEntry`
+    віддає тип і розмір із того самого читання каталогу.
+    """
+    directories: list[Path] = [root]
+    files: list[Path] = []
+    pending: list[Path] = [root]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    name = entry.name
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if _ignored_name(name):
+                                continue
+                            child = Path(entry.path)
+                            directories.append(child)
+                            pending.append(child)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        if _ignored_file_name(name):
+                            continue
+                        if entry.stat().st_size > MAX_SIZE_BYTES:
+                            continue
+                    except OSError:
+                        continue
+                    files.append(Path(entry.path))
+        except OSError:
+            LOGGER.debug("Не вдалося обійти %s", current, exc_info=True)
+    return directories, files
 
 
 class RunFileWatcher(QObject):
@@ -70,15 +109,10 @@ class RunFileWatcher(QObject):
     def start(self, roots: list[Path]) -> None:
         self.stop()
         self._roots = [Path(root).resolve() for root in roots if Path(root).is_dir()]
-        directories: list[str] = []
-        for root in self._roots:
-            for directory, _files in _walk(root):
-                if len(directories) >= MAX_WATCHED_DIRECTORIES:
-                    break
-                directories.append(str(directory))
+        directories, files = self._scan_roots()
         if directories:
-            self._watcher.addPaths(list(dict.fromkeys(directories)))
-        self._known = {str(path) for path in self._collect()}
+            self._watcher.addPaths(directories)
+        self._known = {str(path) for path in files}
 
     def stop(self) -> None:
         self._timer.stop()
@@ -91,38 +125,24 @@ class RunFileWatcher(QObject):
     def _schedule(self) -> None:
         self._timer.start()
 
-    def _watch_new_directories(self) -> None:
-        watched = set(self._watcher.directories())
-        additions: list[str] = []
+    def _scan_roots(self) -> tuple[list[str], list[Path]]:
+        """Один обхід на корінь: і теки для стеження, і файли для показу."""
+        directories: list[str] = []
+        files: list[Path] = []
         for root in self._roots:
-            for directory, _files in _walk(root):
-                text = str(directory)
-                if text in watched:
-                    continue
-                additions.append(text)
-                watched.add(text)
-                if len(watched) >= MAX_WATCHED_DIRECTORIES:
-                    break
-        if additions:
-            self._watcher.addPaths(additions)
-
-    def _collect(self) -> list[Path]:
-        found: list[Path] = []
-        for root in self._roots:
-            try:
-                for _directory, files in _walk(root):
-                    found.extend(
-                        path
-                        for path in files
-                        if path.is_file() and is_interesting(path)
-                    )
-            except OSError:
-                LOGGER.debug("Не вдалося обійти %s", root, exc_info=True)
-        return found
+            found_directories, found_files = scan(root)
+            directories.extend(str(item) for item in found_directories)
+            files.extend(found_files)
+        return list(dict.fromkeys(directories)), files
 
     def rescan(self) -> None:
-        self._watch_new_directories()
-        for path in self._collect():
+        directories, files = self._scan_roots()
+        watched = set(self._watcher.directories())
+        additions = [item for item in directories if item not in watched]
+        room = MAX_WATCHED_DIRECTORIES - len(watched)
+        if additions and room > 0:
+            self._watcher.addPaths(additions[:room])
+        for path in files:
             text = str(path)
             if text in self._known:
                 continue

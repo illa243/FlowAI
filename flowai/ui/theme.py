@@ -146,6 +146,34 @@ QFrame#rejectionCard {{
     border: 1px solid {c["border"]};
     border-radius: {RADII["md"]}px;
 }}
+QFrame#resultImageCard {{
+    background: {c["surface_raised"]};
+    border: 1px solid {c["border"]};
+    border-radius: {RADII["md"]}px;
+    padding: {SPACE["sm"]}px;
+}}
+QLabel#resultImagePreview {{
+    background: {c["surface_sunken"]};
+    border: 1px solid {c["border"]};
+    border-radius: {RADII["sm"]}px;
+    padding: {SPACE["sm"]}px;
+}}
+QLabel#qaVerdictTrue {{
+    background: rgba(34, 197, 94, 0.16);
+    color: #86EFAC;
+    border: 1px solid rgba(34, 197, 94, 0.48);
+    border-radius: {RADII["sm"]}px;
+    padding: 4px 10px;
+    font-weight: 700;
+}}
+QLabel#qaVerdictFalse {{
+    background: rgba(239, 68, 68, 0.16);
+    color: #FCA5A5;
+    border: 1px solid rgba(239, 68, 68, 0.48);
+    border-radius: {RADII["sm"]}px;
+    padding: 4px 10px;
+    font-weight: 700;
+}}
 QTableWidget#diffTable {{
     background: {c["surface_sunken"]};
     border: 1px solid {c["border"]};

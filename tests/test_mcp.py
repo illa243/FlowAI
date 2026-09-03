@@ -84,7 +84,7 @@ def test_schema_describes_the_calibration_node() -> None:
     described = describe_kind("calibrator")
     assert described["label"] == "Calibration Stop"
     assert described["color"] == "#E11D48"
-    assert described["ports"] == []
+    assert described["ports"] == ["out"]
     assert "false_threshold" in described["config"]
 
 

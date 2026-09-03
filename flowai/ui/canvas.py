@@ -1288,6 +1288,9 @@ class FlowScene(QGraphicsScene):
             self.message.emit("Таке з'єднання вже існує")
             return False
         edge = FlowEdge.create(source.model.id, target.model.id, port_name)
+        if source.model.kind == "calibrator" and target.model.kind == "executor":
+            edge.source_path = "data.retry_context"
+            edge.target_variable = "prompt"
         self.workflow.edges.append(edge)
         item = EdgeItem(edge, source, target)
         self.edge_items[edge.id] = item
@@ -1428,6 +1431,10 @@ class FlowScene(QGraphicsScene):
             if item.model.kind == "tasks_manager":
                 item.set_task_states(item._configured_task_states())
             item.refresh_port_labels({})
+        self._running_timer.stop()
+
+    def stop_animations(self) -> None:
+        """Зупинити 60-Гц перемальовування: полотно більше нікому показувати."""
         self._running_timer.stop()
 
     def set_node_status(self, node_id: str, status: str) -> None:

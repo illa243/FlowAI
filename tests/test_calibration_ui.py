@@ -7,10 +7,12 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from flowai.calibration import (
     CalibrationReport,
+    NodeOptimizationReview,
+    OptimizationFinding,
     ProposedEdit,
     RejectionImage,
     RejectionPoint,
@@ -20,6 +22,7 @@ from flowai.calibration import (
 from flowai.models import FlowEdge, FlowNode, Workflow
 from flowai.ui.calibration_dialog import CalibrationDialog, RejectionPointCard
 from flowai.ui.diff_view import DiffView, build_rows
+from flowai.ui.inspector import Inspector
 from flowai.ui.main_window import MainWindow
 from flowai.ui.toast import ToastAction
 from flowai.workspaces import WorkspaceSession
@@ -227,6 +230,106 @@ def test_apply_is_disabled_without_edits() -> None:
     assert make_dialog(make_report(edits=[])).apply_button.isEnabled() is False
 
 
+def test_optimizer_sections_use_authoritative_executor_and_qa_names() -> None:
+    report = make_report(
+        node_reviews=[
+            NodeOptimizationReview(
+                node_id="exec",
+                node_title="Застарілий Executor",
+                score=72,
+                summary="Є повторне читання.",
+                findings=[
+                    OptimizationFinding(
+                        action="Повторне читання",
+                        assessment="suboptimal",
+                        evidence="Кроки 2 і 5",
+                        better_alternative="Повторно використати результат",
+                        expected_gain="Швидше на один виклик",
+                    )
+                ],
+                recommendations=["Кешувати прочитане"],
+            ),
+            NodeOptimizationReview(
+                node_id="qa",
+                node_title="Застарілий QA",
+                score=84,
+                summary="Перевірка доказова.",
+            ),
+        ],
+        edits=[
+            ProposedEdit(
+                target="node_instructions",
+                node_id="exec",
+                label="Скоротити Executor",
+                before="довго",
+                after="коротко",
+            )
+        ],
+    )
+    dialog = CalibrationDialog(
+        report,
+        models=MODELS,
+        default_model="gpt-5.6-sol",
+        default_effort="high",
+        node_titles={"exec": "Executor", "qa": "QA"},
+        node_order=["exec", "qa"],
+    )
+
+    assert dialog.node_section_titles["exec"].text() == "Executor"
+    assert dialog.node_section_titles["qa"].text() == "QA"
+    assert dialog.node_section_frames["exec"].isAncestorOf(dialog.diff_views[0])
+    qa_texts = [
+        label.text()
+        for label in dialog.node_section_frames["qa"].findChildren(QLabel)
+    ]
+    assert "Оцінка ефективності: 84/100" in qa_texts
+    assert "Правки не рекомендовані" in qa_texts
+
+
+def test_stale_node_edit_is_visible_but_cannot_be_applied() -> None:
+    stale = ProposedEdit(
+        target="node_instructions",
+        node_id="gone-node",
+        label="Не застосовувати до видаленої ноди",
+        before="a",
+        after="b",
+    )
+    dialog = CalibrationDialog(
+        make_report(node_reviews=[], edits=[stale]),
+        models=MODELS,
+        default_model="gpt-5.6-sol",
+        default_effort="high",
+        node_titles={"exec": "Executor", "qa": "QA"},
+        node_order=["exec", "qa"],
+    )
+
+    stale_view = next(view for view in dialog.diff_views if view.edit is stale)
+    assert stale.accepted is False
+    assert stale_view.checkbox.isChecked() is False
+    assert dialog.apply_button.isEnabled() is False
+
+
+def test_inspector_auto_skip_round_trips_and_disables_threshold() -> None:
+    workflow = Workflow(name="Optimizer")
+    result = FlowNode.create("result")
+    optimizer = FlowNode.create("calibrator")
+    workflow.nodes.extend([result, optimizer])
+    workflow.edges.append(FlowEdge.create(result.id, optimizer.id, "false"))
+    inspector = Inspector()
+    inspector.set_workflow(workflow)
+    inspector.set_object(optimizer)
+
+    assert inspector.auto_skip.isChecked() is False
+    assert inspector.false_threshold.isEnabled() is True
+    inspector.auto_skip.setChecked(True)
+    assert optimizer.config["auto_skip"] is True
+    assert inspector.false_threshold.isEnabled() is False
+    assert inspector.threshold_hint.isVisible() is False
+    inspector.auto_skip.setChecked(False)
+    assert optimizer.config["auto_skip"] is False
+    assert inspector.false_threshold.isEnabled() is True
+
+
 def test_analysis_error_is_shown_as_a_banner() -> None:
     dialog = make_dialog(make_report(analysis_error="Агент упав"))
     assert dialog.error_banner.isVisible() is True
@@ -258,7 +361,12 @@ def build_session_workflow() -> tuple[Workflow, dict[str, FlowNode]]:
             FlowEdge.create(result.id, stop.id, "false"),
         ]
     )
-    return workflow, {"manager": manager, "executor": executor, "stop": stop}
+    return workflow, {
+        "manager": manager,
+        "executor": executor,
+        "reviewer": reviewer,
+        "stop": stop,
+    }
 
 
 def setup_window(
@@ -304,6 +412,69 @@ def test_apply_writes_the_task_prompt_and_queues_a_retry(
     assert session.intervention_responses[nodes["stop"].id] == {
         "action": "retry_task"
     }
+    session.dirty = False
+    window.close()
+
+
+def test_apply_routes_optimizer_diffs_to_executor_and_qa(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window, session, nodes = setup_window(tmp_path)
+    nodes["executor"].title = "Executor"
+    nodes["reviewer"].title = "QA"
+    nodes["executor"].config["instructions"] = "executor old"
+    nodes["reviewer"].config["instructions"] = "qa old"
+    nodes["reviewer"].config["prompt"] = "qa prompt old"
+    nodes["stop"].config["reviewed_nodes"] = [
+        nodes["executor"].id,
+        nodes["reviewer"].id,
+    ]
+    report = make_report(
+        node_id=nodes["stop"].id,
+        edits=[
+            ProposedEdit(
+                target="node_instructions",
+                node_id=nodes["executor"].id,
+                label="Executor instructions",
+                before="executor old",
+                after="executor new",
+            ),
+            ProposedEdit(
+                target="node_instructions",
+                node_id=nodes["reviewer"].id,
+                label="QA instructions",
+                before="qa old",
+                after="qa new",
+            ),
+            ProposedEdit(
+                target="node_prompt",
+                node_id=nodes["reviewer"].id,
+                label="QA prompt",
+                before="qa prompt old",
+                after="qa prompt new",
+            ),
+            ProposedEdit(
+                target="node_instructions",
+                node_id=nodes["manager"].id,
+                label="Стороння нода",
+                before="",
+                after="не застосовувати",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        CalibrationDialog, "exec", lambda self: self._decide("apply") or 1
+    )
+    monkeypatch.setattr(MainWindow, "run_workflow", lambda self, resume=False: None)
+
+    window._show_calibration(
+        session, calibration_request(report, nodes["stop"].id, tmp_path)
+    )
+
+    assert nodes["executor"].config["instructions"] == "executor new"
+    assert nodes["reviewer"].config["instructions"] == "qa new"
+    assert nodes["reviewer"].config["prompt"] == "qa prompt new"
+    assert "instructions" not in nodes["manager"].config
     session.dirty = False
     window.close()
 

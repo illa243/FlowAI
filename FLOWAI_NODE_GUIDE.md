@@ -110,6 +110,28 @@ FlowAI можуть використовувати їх для стану або
 - `transform` — необов’язковий шаблон із `{{value}}`.
 - `control_points` — візуальні точки вигину; на логіку вони не впливають.
 
+Для agent node, яка має працювати за один раз проаналізованою бібліотекою
+референсів, використовуйте content-addressed cache:
+
+```json
+{
+  "reference_cache": {
+    "mode": "sha256_once",
+    "source_dir": "C:/path/to/UI_refs",
+    "manifest_path": "C:/path/to/skill/references/reference-manifest.json",
+    "analysis_path": "C:/path/to/skill/references/ui-reference-analysis.md",
+    "library_sha256": "expected lowercase SHA-256"
+  }
+}
+```
+
+На першій style-aware ноді runner перевіряє file-level SHA-256 і додає готовий
+analysis до інструкцій. Інші ноди з тим самим config використовують receipt у
+пам'яті runner: нового AI-аналізу всієї теки немає. Якщо склад або вміст
+бібліотеки змінився, нода переходить у `Pause · Attention` з типом
+`reference_analysis_attention`, доки manifest та analysis не будуть оновлені.
+Source directory завжди лишається read-only; усі outputs створюються у workspace.
+
 Якщо наступній ноді потрібне конкретне поле, передавайте саме це поле. Передача
 всього `data` у змінну `input` зручна для `Tasks Manager → Prompt Reviewer`, бо
 Prompt Reviewer розпізнає активне завдання у структурованому пакеті.
@@ -158,6 +180,21 @@ Prompt Reviewer розпізнає активне завдання у струк
 }
 ```
 
+Для плану, який створює попередня нода, використовуйте:
+
+```json
+{
+  "task_source": "input_once",
+  "plan_save_path": "ui_project_spec.json"
+}
+```
+
+На першому проході менеджер знаходить `approved_plan` або `ui_project_spec.tasks`
+у входах, нормалізує Tasks і зберігає plan snapshot та SHA-256 у checkpoint.
+Після PAUSE, retry або перезапуску вхід більше не перечитується: черга завжди
+відновлюється із замороженого snapshot. `plan_save_path` мусить залишатися
+всередині проєктної теки.
+
 Виходи:
 
 - синій `next` — активне завдання; спрацьовує, поки у черзі є невиконані задачі;
@@ -178,6 +215,17 @@ Prompt Reviewer розпізнає активне завдання у струк
     "attachments": []
   },
   "attachments": [],
+  "previous_task_transition": {
+    "status": "approved",
+    "manager_id": "tasks-manager-id",
+    "task_id": "previous-task-id",
+    "result_node_id": "result-id",
+    "branch": "true",
+    "verdict": true,
+    "confirmed_by_user": true,
+    "confirmed_at": "2026-08-24T18:00:00+03:00",
+    "candidate_path": "C:/project/artifacts/review-board.png"
+  },
   "tasks": [],
   "completed_count": 0,
   "task_count": 2
@@ -186,6 +234,21 @@ Prompt Reviewer розпізнає активне завдання у струк
 
 Вкладення активного завдання автоматично додаються до всіх агентів прямого
 ланцюжка до `Result`. Через `Result` вони не переносяться до іншого циклу.
+
+`previous_task_transition` з'являється, починаючи з другого завдання, лише після
+фактичного `Result TRUE` попереднього task. Це trusted receipt рушія, який
+зберігається в checkpoint під ключем `manager_id:task_id`. Для Result із ручним
+підтвердженням квитанція створюється тільки після натискання «Продовжити»;
+закриття діалогу, PAUSE, STOP, незавершений GrillMe, FALSE та EXHAUSTED не
+створюють approval receipt. Старі checkpoint мігруються ідемпотентно з історії
+вже завершених `Result TRUE`.
+
+Prompt Reviewer, Executor і Task Reviewer отримують цю квитанцію в окремому
+розділі системних інструкцій `Підтверджений перехід Flow`. Налаштований
+`transition_adapter` атомарно синхронізує предметний `progress.json` разом із
+receipt; агентам заборонено вручну міняти status/checkpoint. Під час відкриття
+Flow reconciliation ідемпотентно повторює adapter для старих receipts. Receipt
+не замінює QA активного завдання.
 
 На картці менеджера:
 
@@ -275,6 +338,30 @@ JSON-вердикт усе одно передається наступній н
 - `false_limit` — кількість дозволених проходів `false`;
 - `task_attempt_limit` — спроби одного завдання до виходу `EXHAUSTED`;
 - `wait_for_confirmation` — пауза перед переходом для ручного огляду файлів.
+- `confirmation_mode` — `standard`, `plan_approval`, `variant_selection` або
+  `asset_approval`;
+- `confirmation_ports` — порти, на яких потрібне ручне підтвердження;
+- `final_task_result` — лише такий Result створює trusted receipt і завершує
+  активний task;
+- `retry_guard_enabled` / `retry_guard_threshold` — PAUSE при повторному
+  stable `defect_id` або регресії score;
+- `retry_contract_enabled` — зберігати failed checks, protected PASS, editable
+  files/regions та immutable SHA-256 для цільового retry;
+- `transition_adapter` — declarative `json_merge` для атомарного предметного
+  state patch після TRUE. Точні маркери `{state.<field>}` беруть типізоване
+  значення зі стану до merge, `{receipt.<field>}` — з trusted receipt;
+  `default_append_unique` і `task_append_unique` розділяють стандартні та
+  task-specific доповнення списків;
+- `learning_enabled` — додавати QA/user review у project-local learning.
+
+`plan_approval` показує редагований JSON-план. `variant_selection` показує
+checkbox для V01–V04 і повертає `selected_variant_ids`, `selection_mode`, `note`
+та `approved_artifact_hash`. `asset_approval` дозволяє override лише для
+`visual_preference`; `technical_blocker`, `visual_mismatch` і
+`missing_requirement` треба виправити.
+
+Для UI Flow ставте проміжним Result `final_task_result: false`, а Result після
+PSD QA — `true`. Тоді вибір концепту або Synthesis PNG не завершить task завчасно.
 
 При з’єднанні `Result.true → Tasks Manager` ефективний ліміт `true` автоматично
 стає не меншим за кількість завдань. Це дає менеджеру завершити всю чергу навіть
@@ -300,6 +387,25 @@ JSON-вердикт усе одно передається наступній н
 Нода не має портів. Виберіть `monitor_all: true` або задайте `monitored_nodes`.
 Звіт пишеться у `report_path` або у папку поточного запуску.
 
+У шаблоні `examples/game_ui_workflow.flowai.json` Work Reviewer виконує роль
+UI Knowledge Curator. Структуровані Result одразу оновлюють
+`learnings/ui_learnings.jsonl` та `learnings/ui_project_profile.md`, а Curator
+після запуску аналізує протокол. Він може створити diff у
+`learnings/skill-proposals/`, але рушій ніколи не змінює global `modern-ui`
+автоматично.
+
+### Photoshop і чотири UI-концепти
+
+Executor із `variant_contract_enabled: true` повинен повернути рівно V01–V04.
+Рушій перевіряє існування PNG, фактичні SHA-256, новий `round_id` і незмінність
+`frozen_variants`. `enforce_project_outputs: true` відхиляє задекларовані файли
+поза workspace.
+
+Для PSD Builder використовуйте `photoshop_required: true`. FlowAI перевіряє
+наявність Photoshop, запускає COM/JSX без консолі, зберігає JSX та validation
+report у `.flowai/runtime/photoshop/` і повторно відкриває справжній PSD. Помилка
+Photoshop переводить Flow у `Pause · Attention`, не створюючи placeholder-файл.
+
 ## Спільні параметри агентів
 
 Ці поля застосовуються до `Prompt Reviewer`, `Task Executor`, `Task Reviewer` і
@@ -319,7 +425,21 @@ JSON-вердикт усе одно передається наступній н
 - `attachments` — постійні вкладення ноди;
 - `timeout_seconds` — граничний час одного запиту;
 - `retries` — повтори лише після технічної помилки, не після негативного рев’ю;
-- `memory` — `thread` для продовження треду або `fresh` для нового треду.
+- `memory` — `thread`, `fresh` або `task_thread`; останній ізолює контекст за
+  `task_id`, але зберігає потрібну історію retry поточного Task;
+- `context_soft_limit` — після перевищення контексту наступний retry отримує
+  чистий task thread;
+- `prompt_cache_enabled` / `qa_cache_enabled` — content-addressed cache за
+  prompt, schema та SHA-256 фактичних inputs;
+- `operation_policy` — max iterations, patience, min delta і checkpoint cadence;
+- `operation_intent_required` — перед ітеративним Python-скриптом перевірити
+  target check, outputs, metric і budget проти retry contract.
+
+На Windows усі внутрішні запуски Codex app-server — перший старт, транспортний
+restart, login, logout, читання акаунта та списку моделей — проходять через
+централізований launcher із `CREATE_NO_WINDOW`, `STARTF_USESHOWWINDOW` і
+`SW_HIDE`. Це прибирає спалах консолі `codex.exe`, не змінюючи stdio JSON-RPC,
+PAUSE, STOP або очищення дерева процесів через Job Object.
 
 Найменші необхідні права:
 
@@ -454,14 +574,18 @@ Entry/Tasks Manager → Generator → Visual QA (Task Reviewer) → Result
 # Calibration Stop
 
 **Колір:** `#E11D48`. **Входи:** лише вихід FALSE блока Result.
-**Виходи:** немає.
+**Вихід:** `out`, який з'єднується з Executor і передає `data.retry_context`
+у його змінну `prompt`. Пряме ребро Result.FALSE → Executor у такому маршруті
+не допускається.
 
-Зупиняє Flow після K-го відхилення задачі й збирає рекомендації, продовжуючи
-Codex-тред Task Reviewer.
+Після K-го відхилення аналізує невдалий прохід перед повторним виконавцем.
+З `memory: fresh` аналіз працює в незалежному Codex-треді.
 
 | Поле | Що робить |
 |---|---|
-| `false_threshold` | Після якого FALSE зупинятись. За замовчуванням 1 |
+| `false_threshold` | Після якого FALSE зупинятись. За замовчуванням 2 |
+| `auto_skip` | Повністю пропускає модель, звіт та intervention; за замовчуванням `false` |
+| `reviewed_nodes` | ID нод, для яких створюються окремі `node_reviews` і секції правок |
 | `skills` | Скіли, закріплені за нодою: `[{'name': ..., 'path': ...}]` |
 | `thread_source` | id ноди, чий тред продовжується; рушій заповнює сам |
 

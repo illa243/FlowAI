@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Self
@@ -271,6 +272,14 @@ def test_tasks_manager_processes_each_task_and_finishes(
     progress = checkpoint.task_progress[manager.id]
     assert progress["active_task_id"] == ""
     assert progress["completed_task_ids"] == ["task-one", "task-two"]
+    assert set(checkpoint.task_transition_receipts) == {
+        f"{manager.id}:task-one",
+        f"{manager.id}:task-two",
+    }
+    assert all(
+        receipt["confirmed_by_user"] is False
+        for receipt in checkpoint.task_transition_receipts.values()
+    )
     assert set(progress["times"]) == {"task-one", "task-two"}
     assert all(record["seconds"] >= 0 for record in progress["times"].values())
     assert runner.outputs[manager.id].data["branch"] == "done"
@@ -281,9 +290,11 @@ def test_tasks_manager_processes_each_task_and_finishes(
     ]
     assert len(reviewer_calls) == 2
     assert "Проаналізуй перше завдання" in reviewer_calls[0]["prompt"]
-    assert reviewer_calls[0]["attachments"] == [str(first_file)]
+    assert reviewer_calls[0]["attachments"][0] == str(first_file)
+    assert reviewer_calls[0]["attachments"][1].endswith(".json")
     assert "Виконай друге завдання" in reviewer_calls[1]["prompt"]
-    assert reviewer_calls[1]["attachments"] == [str(second_file)]
+    assert reviewer_calls[1]["attachments"][0] == str(second_file)
+    assert reviewer_calls[1]["attachments"][1].endswith(".json")
 
 
 def test_result_without_task_reviewer_is_rejected() -> None:
@@ -505,6 +516,8 @@ def test_result_can_pause_for_manual_confirmation(
 
     assert waiting.status == "waiting"
     assert waiting.data["request"]["type"] == "result_confirmation"
+    assert waiting.data["request"]["score"] == 90
+    assert waiting.data["request"]["review"]["verdict"] is True
     assert checkpoint.port_counts == {}
 
     resumed = WorkflowRunner(
@@ -517,6 +530,118 @@ def test_result_can_pause_for_manual_confirmation(
 
     assert resumed.outputs[pipeline.result.id].data["branch"] == "true"
     assert final.port_counts[f"{pipeline.result.id}:true"] == 1
+
+
+def test_manual_result_feedback_reaches_the_false_branch_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codex_adapter, "FAKE_RESPONDER", verdict_script(False, True))
+    pipeline = Pipeline(tmp_path)
+    pipeline.result.config["wait_for_confirmation"] = True
+
+    first = WorkflowRunner(pipeline.workflow, run_directory=tmp_path / "runs")
+    checkpoint = first.run()
+    assert first.outputs[pipeline.result.id].status == "waiting"
+
+    feedback = "Збережи дах і перемалюй лише контур навколо теплиці"
+    events: list[dict[str, Any]] = []
+    resumed = WorkflowRunner(
+        pipeline.workflow,
+        checkpoint=RunCheckpoint.from_dict(checkpoint.to_dict()),
+        intervention_responses={
+            pipeline.result.id: {
+                "action": "continue_with_feedback",
+                "note": feedback,
+            }
+        },
+        run_directory=tmp_path / "runs",
+        on_event=events.append,
+    )
+    updated = resumed.run()
+
+    executor_prompts = [
+        str(call["prompt"])
+        for call in codex_adapter.FAKE_CALLS
+        if call["model"] == "executor-model"
+    ]
+    assert len(executor_prompts) == 2
+    assert feedback in executor_prompts[-1]
+    reviewer_prompts = [
+        str(call["prompt"])
+        for call in codex_adapter.FAKE_CALLS
+        if call["model"] == "reviewer-model"
+    ]
+    assert len(reviewer_prompts) == 2
+    assert feedback in reviewer_prompts[-1]
+    reviewer_events = [
+        event
+        for event in events
+        if event["type"] == "agent_prompt"
+        and event["node_id"] == pipeline.reviewer.id
+    ]
+    assert feedback in reviewer_events[-1]["instructions"]
+    scope = f"result:{pipeline.result.id}"
+    assert updated.user_requirements[scope] == [feedback]
+    restored = RunCheckpoint.from_dict(updated.to_dict())
+    assert restored.user_requirements[scope] == [feedback]
+    successful_results = [
+        item
+        for item in updated.history[pipeline.result.id]
+        if item["status"] == "success"
+    ]
+    assert successful_results[-1]["data"]["forced"] is True
+    assert f"{pipeline.result.id}:false" not in updated.port_counts
+
+
+def test_manual_result_feedback_persists_for_later_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        codex_adapter, "FAKE_RESPONDER", verdict_script(False, False, True)
+    )
+    pipeline = Pipeline(tmp_path)
+    pipeline.result.config["wait_for_confirmation"] = True
+
+    first = WorkflowRunner(pipeline.workflow, run_directory=tmp_path / "runs")
+    checkpoint = first.run()
+    feedback = "Кіоск і всі логічно пов'язані товари є однією групою"
+
+    second = WorkflowRunner(
+        pipeline.workflow,
+        checkpoint=RunCheckpoint.from_dict(checkpoint.to_dict()),
+        intervention_responses={
+            pipeline.result.id: {
+                "action": "continue_with_feedback",
+                "note": feedback,
+            }
+        },
+        run_directory=tmp_path / "runs",
+    )
+    second_checkpoint = second.run()
+    assert second.outputs[pipeline.result.id].status == "waiting"
+
+    third = WorkflowRunner(
+        pipeline.workflow,
+        checkpoint=RunCheckpoint.from_dict(second_checkpoint.to_dict()),
+        intervention_responses={pipeline.result.id: {"action": "continue"}},
+        run_directory=tmp_path / "runs",
+    )
+    third.run()
+
+    executor_prompts = [
+        str(call["prompt"])
+        for call in codex_adapter.FAKE_CALLS
+        if call["model"] == "executor-model"
+    ]
+    reviewer_prompts = [
+        str(call["prompt"])
+        for call in codex_adapter.FAKE_CALLS
+        if call["model"] == "reviewer-model"
+    ]
+    assert len(executor_prompts) == 3
+    assert len(reviewer_prompts) == 3
+    assert feedback in executor_prompts[-1]
+    assert feedback in reviewer_prompts[-1]
 
 
 def test_result_limits_can_be_updated_while_an_agent_is_running(
@@ -662,7 +787,7 @@ def test_cancel_interrupts_the_active_agent_turn(
 
     assert not thread.is_alive()
     assert any(event["type"] == "node_cancelled" for event in events)
-    assert any(event["type"] == "run_cancelled" for event in events)
+    assert any(event["type"] == "run_stopped" for event in events)
 
 
 def test_required_artifact_is_fingerprinted_and_source_is_protected(
@@ -887,13 +1012,14 @@ def test_task_reviewer_defaults_to_the_improved_prompt(
     assert "Уточнена задача" in call["prompt"]
 
 
-def test_non_json_reviewer_answer_fails_the_node(tmp_path: Path) -> None:
+def test_non_json_reviewer_answer_pauses_with_invalid_contract(tmp_path: Path) -> None:
     pipeline = Pipeline(tmp_path)
     runner = WorkflowRunner(pipeline.workflow, run_directory=tmp_path / "runs")
     runner.run()
-    failed = runner.outputs[pipeline.reviewer.id]
-    assert failed.status == "failed"
-    assert "verdict" in failed.error
+    waiting = runner.outputs[pipeline.reviewer.id]
+    assert waiting.status == "waiting"
+    assert waiting.data["request"]["type"] == "invalid_qa_contract"
+    assert waiting.data["request"]["errors"]
 
 
 def test_prompt_reviewer_sees_the_downstream_chain(
@@ -1023,6 +1149,110 @@ def test_interrupted_turn_raises_instead_of_returning_empty_text() -> None:
 
     with pytest.raises(codex_adapter.TurnInterrupted):
         codex_adapter.agent_run_from_turn(FakeResult(), thread_id="thread-1")
+
+
+def test_codex_cleanup_does_not_mask_a_finished_run() -> None:
+    class BrokenClient:
+        def close(self) -> None:
+            raise OSError(22, "Invalid argument")
+
+    adapter = codex_adapter.CodexAdapter()
+    adapter._client = BrokenClient()
+    adapter._client_handle = object()
+
+    adapter.__exit__(None, None, None)
+
+    assert adapter._client is None
+    assert adapter._client_handle is None
+
+
+def test_transport_close_restarts_codex_and_requests_a_fresh_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai_codex
+
+    monkeypatch.delenv("FLOWAI_FAKE_CODEX", raising=False)
+    stream_closed: list[bool] = []
+    restarted: list[bool] = []
+
+    class BrokenStream:
+        def __iter__(self) -> Self:
+            return self
+
+        def __next__(self) -> Any:
+            raise openai_codex.TransportClosedError("stdout closed")
+
+        def close(self) -> None:
+            stream_closed.append(True)
+
+    class BrokenTurn:
+        id = "turn-1"
+
+        def stream(self) -> BrokenStream:
+            return BrokenStream()
+
+    class BrokenThread:
+        id = "thread-1"
+
+        def turn(self, _run_input: object) -> BrokenTurn:
+            return BrokenTurn()
+
+    class BrokenClient:
+        def thread_start(self, **_kwargs: object) -> BrokenThread:
+            return BrokenThread()
+
+    adapter = codex_adapter.CodexAdapter()
+    adapter._module = openai_codex
+    adapter._client = BrokenClient()
+    monkeypatch.setattr(adapter, "_restart_client", lambda: restarted.append(True))
+
+    with pytest.raises(codex_adapter.TurnInterrupted) as caught:
+        adapter.run_agent(
+            prompt="Перевір результат",
+            developer_instructions="",
+            model="gpt-5.6-sol",
+            sandbox="read-only",
+            workspace=Path.cwd(),
+        )
+
+    assert caught.value.reset_thread is True
+    assert restarted == [True]
+    assert stream_closed == [True]
+
+
+def test_runner_recovers_one_transport_failure_without_configured_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node = FlowNode.create("task_reviewer")
+    workflow = Workflow(name="QA recovery", workspace=str(tmp_path), nodes=[node])
+    events: list[dict[str, Any]] = []
+    runner = WorkflowRunner(workflow, on_event=events.append)
+    runner.checkpoint.thread_ids[node.id] = "broken-thread"
+    calls = 0
+
+    def execute(*_args: object) -> engine_module.NodeResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise codex_adapter.TurnInterrupted(
+                "transport closed", reset_thread=True
+            )
+        return engine_module.NodeResult(node.id, "success", text="QA завершено")
+
+    monkeypatch.setattr(runner, "_execute_node", execute)
+
+    result = runner._execute_with_retries(
+        node=node,
+        inputs={},
+        workspace=tmp_path,
+        codex=None,
+    )
+
+    assert result.status == "success"
+    assert calls == 2
+    assert node.id not in runner.checkpoint.thread_ids
+    retry = next(event for event in events if event["type"] == "node_retry")
+    assert "новому треді" in retry["message"]
 
 
 def test_completed_turn_returns_agent_run() -> None:
@@ -1237,6 +1467,297 @@ def test_task_exhausts_own_attempt_budget(tmp_path: Path) -> None:
     )
 
 
+def test_manual_feedback_does_not_spend_the_managed_task_attempt(
+    tmp_path: Path,
+) -> None:
+    workflow, manager, result = _task_budget_workflow(
+        tmp_path, with_exhausted=True
+    )
+    result.config["wait_for_confirmation"] = True
+
+    def always_reject(call: dict[str, Any]) -> str:
+        if call["model"] == "reviewer-model":
+            return json.dumps(
+                {"verdict": False, "score": 1, "reason": "ні", "must_fix": []}
+            )
+        return "робота"
+
+    codex_adapter.FAKE_RESPONDER = always_reject
+    first = WorkflowRunner(workflow)
+    checkpoint = first.run()
+    feedback = "Не розділяй логічну групу на окремі шари"
+
+    resumed = WorkflowRunner(
+        workflow,
+        checkpoint=RunCheckpoint.from_dict(checkpoint.to_dict()),
+        intervention_responses={
+            result.id: {"action": "continue_with_feedback", "note": feedback}
+        },
+    )
+    updated = resumed.run()
+
+    assert resumed.outputs[result.id].status == "waiting"
+    assert f"{result.id}:t1" not in updated.task_attempts
+    assert f"{result.id}:false" not in updated.port_counts
+    scope = f"task:{manager.id}:t1"
+    assert updated.user_requirements[scope] == [feedback]
+    assert updated.task_transition_receipts == {}
+    executor_prompts = [
+        str(call["prompt"])
+        for call in codex_adapter.FAKE_CALLS
+        if call["model"] == "executor-model"
+    ]
+    reviewer_prompts = [
+        str(call["prompt"])
+        for call in codex_adapter.FAKE_CALLS
+        if call["model"] == "reviewer-model"
+    ]
+    assert feedback in executor_prompts[-1]
+    assert feedback in reviewer_prompts[-1]
+
+
+def test_confirmed_true_result_records_and_forwards_task_transition(
+    tmp_path: Path,
+) -> None:
+    workflow, manager, result = _task_budget_workflow(
+        tmp_path, with_exhausted=True
+    )
+    result.config["wait_for_confirmation"] = True
+    candidate = tmp_path / "review-board.png"
+    candidate.write_bytes(b"board")
+
+    def accept(call: dict[str, Any]) -> str:
+        if call["model"] == "reviewer-model":
+            return json.dumps(
+                {
+                    "verdict": True,
+                    "score": 100,
+                    "reason": "готово",
+                    "must_fix": [],
+                    "candidate_path": str(candidate),
+                },
+                ensure_ascii=False,
+            )
+        return "робота"
+
+    codex_adapter.FAKE_RESPONDER = accept
+    first = WorkflowRunner(workflow)
+    checkpoint = first.run()
+
+    assert first.outputs[result.id].status == "waiting"
+    assert checkpoint.task_transition_receipts == {}
+
+    resumed = WorkflowRunner(
+        workflow,
+        checkpoint=RunCheckpoint.from_dict(checkpoint.to_dict()),
+        intervention_responses={result.id: {"action": "continue"}},
+    )
+    updated = resumed.run()
+
+    progress = updated.task_progress[manager.id]
+    assert progress["completed_task_ids"] == ["t1"]
+    assert progress["active_task_id"] == "t2"
+    receipt = updated.task_transition_receipts[f"{manager.id}:t1"]
+    assert receipt["status"] == "approved"
+    assert receipt["manager_id"] == manager.id
+    assert receipt["task_id"] == "t1"
+    assert receipt["result_node_id"] == result.id
+    assert receipt["branch"] == "true"
+    assert receipt["verdict"] is True
+    assert receipt["confirmed_by_user"] is True
+    assert receipt["candidate_path"] == str(candidate)
+    assert datetime.fromisoformat(receipt["confirmed_at"]).tzinfo is not None
+    assert (
+        resumed.outputs[manager.id].data["previous_task_transition"] == receipt
+    )
+
+    executor_call = next(
+        call
+        for call in reversed(codex_adapter.FAKE_CALLS)
+        if call["model"] == "executor-model"
+    )
+    reviewer_call = next(
+        call
+        for call in reversed(codex_adapter.FAKE_CALLS)
+        if call["model"] == "reviewer-model"
+    )
+    for call in (executor_call, reviewer_call):
+        instructions = str(call["developer_instructions"])
+        assert "# Підтверджений перехід Flow" in instructions
+        assert '"task_id": "t1"' in instructions
+        assert "FlowAI вже атомарно застосував" in instructions
+
+
+def test_old_completed_true_result_recovers_transition_receipt(
+    tmp_path: Path,
+) -> None:
+    workflow, manager, result = _task_budget_workflow(
+        tmp_path, with_exhausted=True
+    )
+    result.config["wait_for_confirmation"] = True
+    finished_at = "2026-08-24T15:41:53+00:00"
+    checkpoint = RunCheckpoint(
+        task_progress={
+            manager.id: {
+                "active_task_id": "t2",
+                "completed_task_ids": ["t1"],
+                "failed_task_ids": [],
+            }
+        },
+        history={
+            result.id: [
+                {
+                    "status": "success",
+                    "finished_at": finished_at,
+                    "data": {
+                        "branch": "true",
+                        "verdict": True,
+                        "task_id": "t1",
+                        "candidate_path": str(tmp_path / "board.png"),
+                    },
+                }
+            ]
+        },
+    )
+
+    WorkflowRunner(workflow, checkpoint=checkpoint)
+
+    receipt = checkpoint.task_transition_receipts[f"{manager.id}:t1"]
+    assert receipt["status"] == "approved"
+    assert receipt["confirmed_by_user"] is True
+    assert receipt["confirmed_at"] == finished_at
+    assert receipt["recovered_from_history"] is True
+
+    restored = RunCheckpoint.from_dict(checkpoint.to_dict())
+    assert restored.task_transition_receipts == checkpoint.task_transition_receipts
+
+
+def test_false_or_exhausted_history_never_recovers_approval(
+    tmp_path: Path,
+) -> None:
+    workflow, manager, result = _task_budget_workflow(
+        tmp_path, with_exhausted=True
+    )
+    checkpoint = RunCheckpoint(
+        task_progress={
+            manager.id: {
+                "active_task_id": "t2",
+                "completed_task_ids": ["t1"],
+                "failed_task_ids": [],
+            }
+        },
+        history={
+            result.id: [
+                {
+                    "status": "success",
+                    "data": {
+                        "branch": "false",
+                        "verdict": False,
+                        "task_id": "t1",
+                    },
+                },
+                {
+                    "status": "success",
+                    "data": {
+                        "branch": "exhausted",
+                        "verdict": False,
+                        "task_id": "t1",
+                    },
+                },
+            ]
+        },
+    )
+
+    WorkflowRunner(workflow, checkpoint=checkpoint)
+
+    assert checkpoint.task_transition_receipts == {}
+
+
+def test_forced_true_from_false_does_not_create_approval_receipt(
+    tmp_path: Path,
+) -> None:
+    workflow, manager, result = _task_budget_workflow(
+        tmp_path, with_exhausted=True
+    )
+    result.config["wait_for_confirmation"] = True
+    codex_adapter.FAKE_RESPONDER = lambda call: (
+        json.dumps(
+            {"verdict": False, "score": 0, "reason": "ні", "must_fix": []}
+        )
+        if call["model"] == "reviewer-model"
+        else "робота"
+    )
+    first = WorkflowRunner(workflow)
+    checkpoint = first.run()
+
+    resumed = WorkflowRunner(
+        workflow,
+        checkpoint=RunCheckpoint.from_dict(checkpoint.to_dict()),
+        intervention_responses={
+            result.id: {"action": "force_branch", "branch": "true"}
+        },
+    )
+    updated = resumed.run()
+
+    assert f"{manager.id}:t1" not in updated.task_transition_receipts
+
+
+def test_stop_while_result_waits_does_not_create_transition_receipt(
+    tmp_path: Path,
+) -> None:
+    workflow, _manager, result = _task_budget_workflow(
+        tmp_path, with_exhausted=True
+    )
+    result.config["wait_for_confirmation"] = True
+    codex_adapter.FAKE_RESPONDER = lambda call: (
+        json.dumps(
+            {"verdict": True, "score": 100, "reason": "так", "must_fix": []}
+        )
+        if call["model"] == "reviewer-model"
+        else "робота"
+    )
+    first = WorkflowRunner(workflow)
+    checkpoint = first.run()
+    stopped = WorkflowRunner(
+        workflow,
+        checkpoint=RunCheckpoint.from_dict(checkpoint.to_dict()),
+    )
+    stopped.cancel()
+
+    updated = stopped.run()
+
+    assert updated.task_transition_receipts == {}
+
+
+def test_old_checkpoint_feedback_is_migrated_for_the_current_task(
+    tmp_path: Path,
+) -> None:
+    workflow, manager, result = _task_budget_workflow(
+        tmp_path, with_exhausted=True
+    )
+    feedback = "Групуй кіоск разом із товарами"
+    checkpoint = RunCheckpoint(
+        task_progress={manager.id: {"active_task_id": "t1"}},
+        history={
+            result.id: [
+                {
+                    "status": "success",
+                    "data": {
+                        "branch": "false",
+                        "user_note": feedback,
+                    },
+                }
+            ]
+        },
+    )
+    runner = WorkflowRunner(workflow, checkpoint=checkpoint)
+
+    requirements = runner._requirements_for_result(result, manager, "t1")
+
+    assert requirements == [feedback]
+    assert checkpoint.user_requirements[f"task:{manager.id}:t1"] == [feedback]
+
+
 def test_without_exhausted_edge_old_dialog_still_fires(tmp_path: Path) -> None:
     workflow, _manager, result = _task_budget_workflow(
         tmp_path, with_exhausted=False
@@ -1271,18 +1792,18 @@ def test_calibrator_is_a_registered_node_kind() -> None:
     assert NODE_LABELS["calibrator"] == "Calibration Stop"
     assert NODE_COLORS["calibrator"] == "#E11D48"
     node = FlowNode.create("calibrator")
-    assert node.config["false_threshold"] == 1
+    assert node.config["false_threshold"] == 2
     assert node.config["sandbox"] == "read-only"
     assert node.config["output_format"] == "json"
     assert node.config["thread_source"] == ""
     assert node.is_agent is True
 
 
-def test_calibrator_has_no_output_ports() -> None:
+def test_calibrator_has_an_output_port() -> None:
     workflow = Workflow()
     node = FlowNode.create("calibrator")
     workflow.nodes.append(node)
-    assert workflow.ports_of(node.id) == ()
+    assert workflow.ports_of(node.id) == ("out",)
 
 
 def test_calibrator_must_hang_on_the_false_port(tmp_path: Path) -> None:
@@ -1296,6 +1817,15 @@ def test_calibrator_must_hang_on_the_false_port(tmp_path: Path) -> None:
 
 def test_calibrator_on_the_false_port_validates(tmp_path: Path) -> None:
     pipeline = Pipeline(tmp_path)
+    pipeline.workflow.edges = [
+        edge
+        for edge in pipeline.workflow.edges
+        if not (
+            edge.source == pipeline.result.id
+            and edge.target == pipeline.executor.id
+            and edge.source_port == "false"
+        )
+    ]
     stop = FlowNode.create("calibrator")
     pipeline.workflow.nodes.append(stop)
     pipeline.workflow.edges.append(
@@ -1317,13 +1847,49 @@ def test_only_one_calibrator_per_result(tmp_path: Path) -> None:
     assert any("лише один" in error for error in errors)
 
 
-def test_calibrator_cannot_be_a_source(tmp_path: Path) -> None:
+def test_calibrator_can_continue_to_executor(tmp_path: Path) -> None:
     pipeline = Pipeline(tmp_path)
+    pipeline.workflow.edges = [
+        edge
+        for edge in pipeline.workflow.edges
+        if not (
+            edge.source == pipeline.result.id
+            and edge.target == pipeline.executor.id
+            and edge.source_port == "false"
+        )
+    ]
     stop = FlowNode.create("calibrator")
     pipeline.workflow.nodes.append(stop)
     pipeline.workflow.edges.append(
         FlowEdge.create(pipeline.result.id, stop.id, "false")
     )
     pipeline.workflow.edges.append(FlowEdge.create(stop.id, pipeline.executor.id, "out"))
+    assert pipeline.workflow.validate() == []
+
+
+def test_result_cannot_bypass_calibrator_on_false(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    stop = FlowNode.create("calibrator")
+    pipeline.workflow.nodes.append(stop)
+    pipeline.workflow.edges.append(
+        FlowEdge.create(pipeline.result.id, stop.id, "false")
+    )
+    pipeline.workflow.edges.append(
+        FlowEdge.create(stop.id, pipeline.executor.id, "out")
+    )
     errors = pipeline.workflow.validate()
-    assert any("не має вихідних портів" in error for error in errors)
+    assert any("не повинен вести напряму в Executor" in error for error in errors)
+
+
+def test_calibrator_output_only_accepts_executor(tmp_path: Path) -> None:
+    pipeline = Pipeline(tmp_path)
+    stop = FlowNode.create("calibrator")
+    pipeline.workflow.nodes.append(stop)
+    pipeline.workflow.edges.append(
+        FlowEdge.create(pipeline.result.id, stop.id, "false")
+    )
+    pipeline.workflow.edges.append(
+        FlowEdge.create(stop.id, pipeline.reviewer.id, "out")
+    )
+    errors = pipeline.workflow.validate()
+    assert any("лише з блоком Executor" in error for error in errors)

@@ -110,7 +110,13 @@ class WorkspaceCard(QFrame):
 
     def refresh(self, spinner_frame: int = 0) -> None:
         self.setProperty("selected", self.selected)
-        rail_state = "selected" if self.selected else "loaded" if self.session.is_loaded else "idle"
+        rail_state = (
+            "selected"
+            if self.selected
+            else "loaded"
+            if self.session.is_loaded
+            else "idle"
+        )
         self.rail.setProperty("state", rail_state)
         self.style().unpolish(self)
         self.style().polish(self)
@@ -127,14 +133,21 @@ class WorkspaceCard(QFrame):
 
     def _update_status_icon(self, spinner_frame: int) -> None:
         state = self.session.run_state
-        if state == "running":
+        if self.session.pending_intervention is not None and state in {
+            "paused",
+            "needs_attention",
+        }:
+            icon, tooltip, visual_state = (
+                "Ⅱ",
+                "Пауза — очікує на вашу відповідь",
+                "attention",
+            )
+        elif state == "running":
             icon, tooltip, visual_state = (
                 SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)],
                 "Виконується",
                 "running",
             )
-        elif state == "needs_attention":
-            icon, tooltip, visual_state = "⚠", "Очікує на вашу відповідь", "attention"
         elif state == "failed":
             icon, tooltip, visual_state = "✕", "Помилка виконання", "failed"
         elif state == "paused":
@@ -291,13 +304,15 @@ class WorkspaceSidebar(QWidget):
     def _update_summary(self) -> None:
         running = sum(session.run_state == "running" for session in self._sessions)
         attention = sum(
-            session.run_state == "needs_attention" for session in self._sessions
+            session.pending_intervention is not None
+            and session.run_state in {"paused", "needs_attention"}
+            for session in self._sessions
         )
         parts: list[str] = []
         if running:
             parts.append(f"Працює: {running}")
         if attention:
-            parts.append(f"Потребує уваги: {attention}")
+            parts.append(f"На паузі · Attention: {attention}")
         summary = " · ".join(parts) if parts else "Немає активних Flow"
         self.summary.setText(summary)
         self.list_widget.setToolTip(summary)

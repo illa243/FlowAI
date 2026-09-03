@@ -17,7 +17,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..calibration import CalibrationReport, RejectionPoint
+from ..calibration import (
+    CalibrationReport,
+    NodeOptimizationReview,
+    ProposedEdit,
+    RejectionPoint,
+)
 from .controls import AnimatedButton
 from .design import COLORS, SPACE
 from .diff_view import DiffView
@@ -112,15 +117,21 @@ class CalibrationDialog(AnimatedDialog):
         models: list[str],
         default_model: str,
         default_effort: str,
+        node_titles: dict[str, str] | None = None,
+        node_order: list[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.report = report
         self.decision = ""
         self.model = default_model
         self.effort = default_effort
+        self.node_titles = dict(node_titles or {})
+        self.node_order = list(node_order or [])
         self.point_cards: list[RejectionPointCard] = []
         self.diff_views: list[DiffView] = []
         self.skill_boxes: list[QCheckBox] = []
+        self.node_section_titles: dict[str, QLabel] = {}
+        self.node_section_frames: dict[str, QFrame] = {}
 
         self.setWindowTitle(f"Відхилено: {report.task_title}")
         self.setMinimumSize(1040, 720)
@@ -199,21 +210,128 @@ class CalibrationDialog(AnimatedDialog):
                 box = QCheckBox(name)
                 self.skill_boxes.append(box)
                 layout.addWidget(box)
-        if not self.report.edits:
+        reviews = {review.node_id: review for review in self.report.node_reviews}
+        node_ids: list[str] = []
+        for node_id in self.node_order:
+            if node_id and node_id not in node_ids:
+                node_ids.append(node_id)
+        for review in self.report.node_reviews:
+            if review.node_id and review.node_id not in node_ids:
+                node_ids.append(review.node_id)
+        for edit in self.report.edits:
+            if (
+                edit.target in {"node_prompt", "node_instructions"}
+                and edit.node_id
+                and edit.node_id not in node_ids
+            ):
+                node_ids.append(edit.node_id)
+
+        for node_id in node_ids:
+            outside_review_scope = bool(
+                self.node_order and node_id not in self.node_order
+            )
+            stale_node = bool(
+                self.node_titles and node_id not in self.node_titles
+            )
+            if outside_review_scope or stale_node:
+                for edit in self.report.edits:
+                    if edit.node_id == node_id:
+                        edit.accepted = False
+            self._add_node_section(
+                layout,
+                node_id,
+                reviews.get(node_id),
+                [edit for edit in self.report.edits if edit.node_id == node_id],
+            )
+
+        remaining = [
+            edit
+            for edit in self.report.edits
+            if edit.target not in {"node_prompt", "node_instructions"}
+            or not edit.node_id
+        ]
+        if remaining:
+            heading = QLabel("Інші правки")
+            heading.setObjectName("sectionTitle")
+            layout.addWidget(heading)
+            for edit in remaining:
+                view = DiffView(edit)
+                self.diff_views.append(view)
+                layout.addWidget(view)
+
+        if not node_ids and not remaining:
             empty = QLabel("Рев'ювер не запропонував конкретних правок.")
             empty.setObjectName("mutedLabel")
             layout.addWidget(empty)
-        for edit in self.report.edits:
-            view = DiffView(edit)
-            self.diff_views.append(view)
-            layout.addWidget(view)
         layout.addStretch()
         return area
+
+    def _add_node_section(
+        self,
+        layout: QVBoxLayout,
+        node_id: str,
+        review: NodeOptimizationReview | None,
+        edits: list[ProposedEdit],
+    ) -> None:
+        frame = QFrame()
+        frame.setObjectName("rejectionCard")
+        section = QVBoxLayout(frame)
+        section.setContentsMargins(
+            SPACE["md"], SPACE["md"], SPACE["md"], SPACE["md"]
+        )
+        section.setSpacing(SPACE["xs"])
+
+        fallback = review.node_title if review is not None else node_id
+        title_text = self.node_titles.get(node_id, fallback or "Невідома нода")
+        title = QLabel(title_text)
+        title.setObjectName("sectionTitle")
+        section.addWidget(title)
+        self.node_section_titles[node_id] = title
+        self.node_section_frames[node_id] = frame
+
+        if review is not None:
+            score = QLabel(f"Оцінка ефективності: {review.score}/100")
+            score.setObjectName("mutedLabel")
+            section.addWidget(score)
+            if review.summary:
+                summary = QLabel(review.summary)
+                summary.setWordWrap(True)
+                section.addWidget(summary)
+            for finding in review.findings:
+                parts = [f"[{finding.assessment}] {finding.action}".strip()]
+                if finding.evidence:
+                    parts.append(f"Доказ: {finding.evidence}")
+                if finding.better_alternative:
+                    parts.append(f"Краще: {finding.better_alternative}")
+                if finding.expected_gain:
+                    parts.append(f"Виграш: {finding.expected_gain}")
+                finding_label = QLabel("\n".join(parts))
+                finding_label.setWordWrap(True)
+                finding_label.setObjectName("mutedLabel")
+                section.addWidget(finding_label)
+            if review.recommendations:
+                recommendations = QLabel(
+                    "Рекомендації:\n"
+                    + "\n".join(f"• {item}" for item in review.recommendations)
+                )
+                recommendations.setWordWrap(True)
+                section.addWidget(recommendations)
+
+        if edits:
+            for edit in edits:
+                view = DiffView(edit)
+                self.diff_views.append(view)
+                section.addWidget(view)
+        else:
+            empty = QLabel("Правки не рекомендовані")
+            empty.setObjectName("mutedLabel")
+            section.addWidget(empty)
+        layout.addWidget(frame)
 
     def _build_buttons(self, models: list[str]) -> QHBoxLayout:
         row = QHBoxLayout()
         self.apply_button = AnimatedButton("Застосувати правки", "primary")
-        self.apply_button.setEnabled(bool(self.report.edits))
+        self.apply_button.setEnabled(bool(self.report.accepted_edits()))
         self.apply_button.clicked.connect(lambda: self._decide("apply"))
         row.addWidget(self.apply_button)
 

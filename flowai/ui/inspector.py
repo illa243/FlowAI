@@ -63,12 +63,13 @@ AGENT_FIELDS = {
 
 KIND_FIELDS: dict[str, set[str]] = {
     "entry": {"entry_text", "entry_json", "attachments"},
-    "tasks_manager": {"tasks"},
+    "tasks_manager": {"tasks", "task_source", "plan_save_path"},
     "prompt_reviewer": set(AGENT_FIELDS),
     "executor": set(AGENT_FIELDS),
     "task_reviewer": AGENT_FIELDS | {"criteria_node"},
     "work_reviewer": AGENT_FIELDS | {"monitor_all", "monitored_nodes", "report_path"},
-    "calibrator": AGENT_FIELDS | {"false_threshold", "threshold_hint"},
+    "calibrator": AGENT_FIELDS
+    | {"false_threshold", "auto_skip", "threshold_hint"},
     "result": {
         "template",
         "save_path",
@@ -76,6 +77,12 @@ KIND_FIELDS: dict[str, set[str]] = {
         "false_limit",
         "task_attempt_limit",
         "wait_for_confirmation",
+        "confirmation_mode",
+        "confirmation_ports",
+        "final_task_result",
+        "retry_guard_enabled",
+        "retry_guard_threshold",
+        "learning_enabled",
     },
 }
 
@@ -546,6 +553,13 @@ class Inspector(QWidget):
 
         self.tasks_editor = ManagedTasksWidget()
         self.node_form.addRow("Завдання", self.tasks_editor)
+        self.task_source = NoWheelComboBox()
+        self.task_source.addItem("Статичний список", "static")
+        self.task_source.addItem("З входу один раз", "input_once")
+        self.node_form.addRow("Джерело Tasks", self.task_source)
+        self.plan_save_path = QLineEdit()
+        self.plan_save_path.setPlaceholderText("ui_project_spec.json")
+        self.node_form.addRow("Файл погодженого плану", self.plan_save_path)
 
         self.model_combo = PopupComboBox()
         self.model_combo.addItems(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
@@ -568,6 +582,7 @@ class Inspector(QWidget):
 
         self.memory_combo = NoWheelComboBox()
         self.memory_combo.addItem("Той самий тред", "thread")
+        self.memory_combo.addItem("Окремий тред для Task", "task_thread")
         self.memory_combo.addItem("Новий тред щоразу", "fresh")
         self.node_form.addRow("Пам'ять між спробами", self.memory_combo)
 
@@ -656,12 +671,19 @@ class Inspector(QWidget):
 
         self.false_threshold = NoWheelSpinBox()
         self.false_threshold.setRange(1, 20)
-        self.false_threshold.setValue(1)
+        self.false_threshold.setValue(2)
         self.false_threshold.setToolTip(
             "Після якого за рахунком FALSE зупиняти Flow і показувати "
             "рекомендації"
         )
         self.node_form.addRow("Зупиняти після FALSE №", self.false_threshold)
+
+        self.auto_skip = QCheckBox("AutoSkip")
+        self.auto_skip.setToolTip(
+            "Повністю пропустити аналіз Calibration Stop: без виклику моделі, "
+            "звіту та очікування підтвердження"
+        )
+        self.node_form.addRow(self.auto_skip)
 
         self.threshold_hint = ExplicitVisibilityLabel("")
         self.threshold_hint.setObjectName("mutedLabel")
@@ -672,6 +694,24 @@ class Inspector(QWidget):
             "Очікувати підтвердження перед переходом"
         )
         self.node_form.addRow(self.wait_for_confirmation)
+        self.confirmation_mode = NoWheelComboBox()
+        self.confirmation_mode.addItem("Стандартний", "standard")
+        self.confirmation_mode.addItem("Погодження UI-плану", "plan_approval")
+        self.confirmation_mode.addItem("Вибір PNG-варіантів", "variant_selection")
+        self.confirmation_mode.addItem("Погодження PSD", "asset_approval")
+        self.node_form.addRow("Режим підтвердження", self.confirmation_mode)
+        self.confirmation_ports = QLineEdit()
+        self.confirmation_ports.setPlaceholderText("true,false")
+        self.node_form.addRow("Підтверджувати порти", self.confirmation_ports)
+        self.final_task_result = QCheckBox("Фінальний Result поточного task")
+        self.node_form.addRow(self.final_task_result)
+        self.retry_guard_enabled = QCheckBox("Pause при повторному QA-дефекті")
+        self.node_form.addRow(self.retry_guard_enabled)
+        self.retry_guard_threshold = NoWheelSpinBox()
+        self.retry_guard_threshold.setRange(2, 10)
+        self.node_form.addRow("Поріг повторів дефекту", self.retry_guard_threshold)
+        self.learning_enabled = QCheckBox("Оновлювати локальне UI-навчання")
+        self.node_form.addRow(self.learning_enabled)
 
         self.monitor_all = QCheckBox("Спостерігати всі блоки Flow")
         self.node_form.addRow(self.monitor_all)
@@ -687,6 +727,8 @@ class Inspector(QWidget):
             "entry_text": self.entry_text,
             "entry_json": self.entry_json,
             "tasks": self.tasks_editor,
+            "task_source": self.task_source,
+            "plan_save_path": self.plan_save_path,
             "model": self.model_combo,
             "reasoning": self.reasoning_combo,
             "sandbox": self.sandbox_combo,
@@ -708,8 +750,15 @@ class Inspector(QWidget):
             "false_limit": self.false_limit,
             "task_attempt_limit": self.task_attempt_limit,
             "false_threshold": self.false_threshold,
+            "auto_skip": self.auto_skip,
             "threshold_hint": self.threshold_hint,
             "wait_for_confirmation": self.wait_for_confirmation,
+            "confirmation_mode": self.confirmation_mode,
+            "confirmation_ports": self.confirmation_ports,
+            "final_task_result": self.final_task_result,
+            "retry_guard_enabled": self.retry_guard_enabled,
+            "retry_guard_threshold": self.retry_guard_threshold,
+            "learning_enabled": self.learning_enabled,
             "monitor_all": self.monitor_all,
             "monitored_nodes": self.monitored_nodes,
             "report_path": self.report_path,
@@ -723,6 +772,8 @@ class Inspector(QWidget):
         self.entry_text.textChanged.connect(self._save_node)
         self.entry_json.textChanged.connect(self._save_node)
         self.tasks_editor.tasks_changed.connect(self._save_node)
+        self.task_source.currentIndexChanged.connect(self._save_node)
+        self.plan_save_path.textEdited.connect(self._save_node)
         self.model_combo.currentTextChanged.connect(self._save_node)
         self.reasoning_combo.currentTextChanged.connect(self._save_node)
         self.sandbox_combo.currentIndexChanged.connect(self._save_node)
@@ -740,7 +791,14 @@ class Inspector(QWidget):
         self.false_limit.valueChanged.connect(self._save_node)
         self.task_attempt_limit.valueChanged.connect(self._save_node)
         self.false_threshold.valueChanged.connect(self._save_node)
+        self.auto_skip.toggled.connect(self._auto_skip_toggled)
         self.wait_for_confirmation.toggled.connect(self._save_node)
+        self.confirmation_mode.currentIndexChanged.connect(self._save_node)
+        self.confirmation_ports.textEdited.connect(self._save_node)
+        self.final_task_result.toggled.connect(self._save_node)
+        self.retry_guard_enabled.toggled.connect(self._save_node)
+        self.retry_guard_threshold.valueChanged.connect(self._save_node)
+        self.learning_enabled.toggled.connect(self._save_node)
         self.attachments.paths_changed.connect(self._save_node)
         self.skill_pins.skills_changed.connect(self._save_node)
         self.monitor_all.toggled.connect(self._monitor_all_toggled)
@@ -874,6 +932,13 @@ class Inspector(QWidget):
             self._update_prompt_field_state()
             if (
                 isinstance(self.current, FlowNode)
+                and self.current.kind == "calibrator"
+            ):
+                self.false_threshold.setEnabled(
+                    not self.auto_skip.isChecked()
+                )
+            if (
+                isinstance(self.current, FlowNode)
                 and self.current.kind == "work_reviewer"
             ):
                 self.monitored_nodes.setEnabled(not self.monitor_all.isChecked())
@@ -898,6 +963,12 @@ class Inspector(QWidget):
             json.dumps(node.config.get("json") or {}, ensure_ascii=False, indent=2)
         )
         self.tasks_editor.set_tasks(node.config.get("tasks"))
+        self._set_combo_data(
+            self.task_source, str(node.config.get("task_source", "static"))
+        )
+        self.plan_save_path.setText(
+            str(node.config.get("plan_save_path", "ui_project_spec.json"))
+        )
         self.model_combo.setCurrentText(str(node.config.get("model", "gpt-5.6-terra")))
         self.reasoning_combo.setCurrentText(
             str(node.config.get("reasoning_effort", "medium"))
@@ -959,6 +1030,28 @@ class Inspector(QWidget):
         self.wait_for_confirmation.setChecked(
             bool(node.config.get("wait_for_confirmation", False))
         )
+        self._set_combo_data(
+            self.confirmation_mode,
+            str(node.config.get("confirmation_mode", "standard")),
+        )
+        ports = node.config.get("confirmation_ports", ["true", "false"])
+        self.confirmation_ports.setText(
+            ",".join(str(item) for item in ports)
+            if isinstance(ports, list)
+            else str(ports)
+        )
+        self.final_task_result.setChecked(
+            bool(node.config.get("final_task_result", True))
+        )
+        self.retry_guard_enabled.setChecked(
+            bool(node.config.get("retry_guard_enabled", False))
+        )
+        self.retry_guard_threshold.setValue(
+            max(2, int(node.config.get("retry_guard_threshold", 2)))
+        )
+        self.learning_enabled.setChecked(
+            bool(node.config.get("learning_enabled", False))
+        )
 
         watch_all = bool(node.config.get("monitor_all", True))
         self.monitor_all.setChecked(watch_all)
@@ -980,8 +1073,10 @@ class Inspector(QWidget):
         self.report_path.setText(str(node.config.get("report_path", "")))
 
         self.false_threshold.setValue(
-            max(1, int(node.config.get("false_threshold", 1)))
+            max(1, int(node.config.get("false_threshold", 2)))
         )
+        self.auto_skip.setChecked(bool(node.config.get("auto_skip", False)))
+        self.false_threshold.setEnabled(not self.auto_skip.isChecked())
         self._show_node_fields(node.kind)
         self._update_threshold_hint(node)
         self._update_prompt_field_state()
@@ -1032,6 +1127,10 @@ class Inspector(QWidget):
             node.config["attachments"] = self._list_values(self.attachments)
         elif node.kind == "tasks_manager":
             node.config["tasks"] = self.tasks_editor.tasks()
+            node.config["task_source"] = self.task_source.currentData()
+            node.config["plan_save_path"] = (
+                self.plan_save_path.text().strip() or "ui_project_spec.json"
+            )
         elif node.kind == "result":
             node.config["template"] = self.template_edit.toPlainText()
             node.config["save_path"] = self.save_path.text().strip()
@@ -1041,6 +1140,16 @@ class Inspector(QWidget):
             node.config["wait_for_confirmation"] = (
                 self.wait_for_confirmation.isChecked()
             )
+            node.config["confirmation_mode"] = self.confirmation_mode.currentData()
+            node.config["confirmation_ports"] = [
+                item.strip().lower()
+                for item in self.confirmation_ports.text().replace(";", ",").split(",")
+                if item.strip().lower() in {"true", "false", "exhausted"}
+            ] or ["true", "false"]
+            node.config["final_task_result"] = self.final_task_result.isChecked()
+            node.config["retry_guard_enabled"] = self.retry_guard_enabled.isChecked()
+            node.config["retry_guard_threshold"] = self.retry_guard_threshold.value()
+            node.config["learning_enabled"] = self.learning_enabled.isChecked()
         else:
             node.config.update(
                 {
@@ -1073,6 +1182,7 @@ class Inspector(QWidget):
                 node.config["report_path"] = self.report_path.text().strip()
             elif node.kind == "calibrator":
                 node.config["false_threshold"] = self.false_threshold.value()
+                node.config["auto_skip"] = self.auto_skip.isChecked()
                 self._update_threshold_hint(node)
 
         self.changed.emit(node)
@@ -1080,10 +1190,14 @@ class Inspector(QWidget):
     def _update_threshold_hint(self, node: FlowNode) -> None:
         """Попередити, що за цього порога EXHAUSTED не спрацює."""
         self.threshold_hint.clear()
-        if node.kind != "calibrator" or self.workflow is None:
+        if (
+            node.kind != "calibrator"
+            or self.workflow is None
+            or bool(node.config.get("auto_skip", False))
+        ):
             self.threshold_hint.setVisible(False)
             return
-        threshold = max(1, int(node.config.get("false_threshold", 1)))
+        threshold = max(1, int(node.config.get("false_threshold", 2)))
         limits = [
             max(1, int(source.config.get("task_attempt_limit", 2)))
             for edge in self.workflow.incoming(node.id)
@@ -1099,6 +1213,10 @@ class Inspector(QWidget):
             self.threshold_hint.setVisible(True)
         else:
             self.threshold_hint.setVisible(False)
+
+    def _auto_skip_toggled(self, checked: bool) -> None:
+        self.false_threshold.setEnabled(not checked)
+        self._save_node()
 
     def _save_edge(self, *args: Any) -> None:
         if (

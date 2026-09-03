@@ -32,19 +32,39 @@ def resolve_path(value: Any, path: str, default: Any = None) -> Any:
     return current
 
 
-def stringify(value: Any) -> str:
+def clip(text: str, limit: int | None) -> str:
+    """Обрізати текст із явною позначкою, скільки саме не показано.
+
+    Без позначки скорочення виглядає як обірваний файл: агент не бачить,
+    що частина матеріалу лишилася на диску, і починає здогадуватися.
+    """
+    if limit is None or limit <= 0 or len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return text[:limit] + f"\n… [скорочено {omitted} символів]"
+
+
+def stringify(value: Any, *, limit: int | None = None) -> str:
+    """Звести значення до тексту.
+
+    `limit` ставиться лише там, де текст іде в промпт. Дані, які течуть по
+    ребрах Flow, серіалізуються без стелі — обрізаний трансформ був би
+    мовчазним псуванням даних, а не економією контексту.
+    """
     if isinstance(value, str):
-        return value
+        return clip(value, limit)
     if value is None:
         return ""
-    return json.dumps(value, ensure_ascii=False, indent=2)
+    return clip(json.dumps(value, ensure_ascii=False, indent=2), limit)
 
 
-def render_template(template: str, context: dict[str, Any]) -> str:
+def render_template(
+    template: str, context: dict[str, Any], *, value_limit: int | None = None
+) -> str:
     def replace(match: re.Match[str]) -> str:
         path = match.group(1)
         found = resolve_path(context, path, default=f"{{{{{path}}}}}")
-        return stringify(found)
+        return stringify(found, limit=value_limit)
 
     return PLACEHOLDER.sub(replace, template)
 
@@ -151,9 +171,44 @@ def extract_json(text: str) -> Any | None:
     if not starts:
         return None
     start = min(starts)
-    for end in range(len(stripped), start, -1):
-        try:
-            return json.loads(stripped[start:end])
-        except json.JSONDecodeError:
+    end = _balanced_end(stripped, start)
+    if end is None:
+        return None
+    try:
+        return json.loads(stripped[start:end])
+    except json.JSONDecodeError:
+        return None
+
+
+def _balanced_end(text: str, start: int) -> int | None:
+    """Кінець збалансованого JSON-блоку, що починається на `start`.
+
+    Перебір усіх кінцевих позицій коштував O(n²): довга відповідь із
+    незакритою дужкою займала десятки секунд. Один прохід із урахуванням
+    рядків і екранування дає ту саму межу за O(n).
+    """
+    pairs = {"{": "}", "[": "]"}
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
             continue
+        if character == '"':
+            in_string = True
+        elif character in pairs:
+            stack.append(pairs[character])
+        elif character in {"}", "]"}:
+            if not stack or stack[-1] != character:
+                return None
+            stack.pop()
+            if not stack:
+                return index + 1
     return None

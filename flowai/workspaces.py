@@ -19,7 +19,6 @@ class WorkspaceSession:
     unread_result: bool = False
     dirty: bool = False
     custom_name: bool = False
-    log_text: str = ""
     run_events: list[dict[str, Any]] = field(default_factory=list)
     node_statuses: dict[str, str] = field(default_factory=dict)
     node_durations: dict[str, float] = field(default_factory=dict)
@@ -28,6 +27,8 @@ class WorkspaceSession:
     node_stages: dict[str, tuple[int, int, str]] = field(default_factory=dict)
     task_states: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     port_counts: dict[str, int] = field(default_factory=dict)
+    # (нода, порт) останньої розсилки — щоб підсвітити саме ту лінію, що спрацювала.
+    last_dispatch: tuple[str, str] = ("", "")
     checkpoint: Any = None
     run_directory: Any = None
     intervention_responses: dict[str, Any] = field(default_factory=dict)
@@ -48,6 +49,9 @@ class WorkspaceSession:
     active_file_node_id: str = ""
     active_file_iteration: int = 0
     stop_requested: bool = False
+    # Resumable STOP already requested; the active turn is being interrupted
+    # and its node/inputs will be returned to the checkpoint queue.
+    stop_pending: bool = False
 
     @property
     def is_loaded(self) -> bool:
@@ -61,10 +65,19 @@ class WorkspaceSession:
     def status_text(self) -> str:
         if self.stop_requested:
             return "Зупиняється"
+        # Питання до користувача важливіше за обіцянку майбутньої зупинки:
+        # поки на нього не дадуть відповіді, Flow не зрушить із місця.
+        if self.pending_intervention is not None and self.run_state in {
+            "paused",
+            "needs_attention",
+        }:
+            return "Пауза — очікує на вашу відповідь"
+        if self.stop_pending:
+            return "Перериває операцію зі збереженням"
+        if self.run_state == "stopped":
+            return "Зупинено — можна продовжити"
         if self.run_state == "running":
             return "Виконується"
-        if self.run_state == "needs_attention":
-            return "Очікує на вашу відповідь"
         if self.run_state == "failed":
             return "Помилка виконання"
         if self.run_state == "paused":

@@ -130,3 +130,60 @@ def test_materials_question_renders_three_buttons(tmp_path: Path) -> None:
     assert len(dialog.option_buttons) == 3
     assert dialog.question_text.text() == MATERIALS_QUESTION
     dialog.close()
+
+
+def test_review_feedback_mode_shows_an_editable_instruction(tmp_path: Path) -> None:
+    application()
+    dialog = GrillDialog(
+        _workflow(),
+        "gpt-5.6-terra",
+        tmp_path,
+        review_feedback={"verdict": False, "reason": "Контур неточний"},
+    )
+    dialog.show_outcome(
+        GrillOutcome(
+            summary="Правки узгоджено",
+            feedback="Перемалюй лише зовнішній контур",
+        )
+    )
+
+    assert "Обговорити правки" in dialog.windowTitle()
+    assert dialog.run_button.text() == "Відправити правки"
+    assert dialog.edit_button.isHidden()
+    assert "зовнішній контур" in dialog.diff_text()
+    dialog.feedback_editor.setPlainText("Не змінюй дах")
+    dialog._decide("run")
+
+    assert dialog.outcome is not None
+    assert dialog.outcome.feedback == "Не змінюй дах"
+    dialog.close()
+
+
+def test_dialog_emits_each_answer_for_incremental_persistence(
+    tmp_path: Path,
+) -> None:
+    application()
+    dialog = GrillDialog(
+        _workflow(),
+        "gpt-5.6-terra",
+        tmp_path,
+        review_feedback={
+            "verdict": False,
+            "grill_transcript": [{"question": "Що виправити?", "answer": "Контур"}],
+        },
+    )
+    snapshots: list[list[dict[str, str]]] = []
+    dialog.transcript_changed.connect(snapshots.append)
+    dialog.show_question(
+        GrillQuestion(text="Що зберегти?", options=["Дах", "Своя відповідь"])
+    )
+
+    dialog._submit("Дах")
+
+    assert snapshots == [
+        [
+            {"question": "Що виправити?", "answer": "Контур"},
+            {"question": "Що зберегти?", "answer": "Дах"},
+        ]
+    ]
+    dialog.close()

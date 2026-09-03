@@ -117,6 +117,22 @@ Entry prompt → Prompt Reviewer → Task Executor → Task Reviewer → Result
 зокрема, для постійних інструкцій, промптів, JSON-схем і шаблону результату.
 
 Готовий файл-приклад: [examples/review_loop.flowai.json](examples/review_loop.flowai.json).
+
+Для ігрових UI-задач використовуйте
+[examples/game_ui_workflow.flowai.json](examples/game_ui_workflow.flowai.json):
+одноразовий brief → погоджений dynamic Tasks → чотири PNG-концепти → optional
+Synthesis PNG → layered PSD у Photoshop → PSD QA → фінальне підтвердження.
+Шаблон уже підключений до `C:\Users\illia\Desktop\UI_refs`: 66 референсів
+проаналізовано один раз у skill `modern-ui`, а наступні запуски використовують
+перевірений SHA-256 cache замість повторного повного аналізу картинок.
+
+Для довгих retry FlowAI зберігає машинний контракт failed/protected checks,
+перевіряє operation intent до запуску ітеративного Python-скрипта, показує
+`iteration/max/best` і зупиняє безрезультатний алгоритм за convergence policy —
+без часового ліміту Executor. STOP перериває поточний turn, повертає ноду в
+чергу й лишає resumable checkpoint. `Запуск → Відновити прогрес з останнього
+журналу` відбудовує checkpoint зі старого event log; `Відкинути збережений
+прогрес` є окремою дією й не видаляє артефакти.
 Файли формату 1 не конвертуються автоматично через повну зміну набору блоків.
 
 ## Робочі середовища

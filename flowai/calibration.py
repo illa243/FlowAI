@@ -12,9 +12,30 @@ EDIT_TARGETS = frozenset(
 
 CALIBRATION_SCHEMA: dict[str, Any] = {
     "summary": "string",
+    "root_cause_category": "artifact|agent_strategy|engine_state|tool_failure",
     "root_cause": "string",
     "skills_used": ["string"],
     "skills_missing": ["string"],
+    "node_reviews": [
+        {
+            "node_id": "string",
+            "node_title": "string",
+            "score": 0,
+            "summary": "string",
+            "findings": [
+                {
+                    "action": "string",
+                    "assessment": (
+                        "necessary | unnecessary | suboptimal | incorrect"
+                    ),
+                    "evidence": "string",
+                    "better_alternative": "string",
+                    "expected_gain": "string",
+                }
+            ],
+            "recommendations": ["string"],
+        }
+    ],
     "points": [
         {
             "title": "string",
@@ -82,6 +103,81 @@ class RejectionPoint:
             detail=str(raw.get("detail", "")),
             images=images,
             user_note=str(raw.get("user_note", "")),
+        )
+
+
+@dataclass(slots=True)
+class OptimizationFinding:
+    """Одна фактична дія ноди та оцінка її ефективності."""
+
+    action: str
+    assessment: str = ""
+    evidence: str = ""
+    better_alternative: str = ""
+    expected_gain: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "action": self.action,
+            "assessment": self.assessment,
+            "evidence": self.evidence,
+            "better_alternative": self.better_alternative,
+            "expected_gain": self.expected_gain,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> OptimizationFinding:
+        return cls(
+            action=str(raw.get("action", "")).strip() or "Дія не вказана",
+            assessment=str(raw.get("assessment", "")).strip(),
+            evidence=str(raw.get("evidence", "")).strip(),
+            better_alternative=str(raw.get("better_alternative", "")).strip(),
+            expected_gain=str(raw.get("expected_gain", "")).strip(),
+        )
+
+
+@dataclass(slots=True)
+class NodeOptimizationReview:
+    """Оцінка ефективності однієї конкретної ноди Flow."""
+
+    node_id: str
+    node_title: str = ""
+    score: int = 0
+    summary: str = ""
+    findings: list[OptimizationFinding] = field(default_factory=list)
+    recommendations: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "node_title": self.node_title,
+            "score": self.score,
+            "summary": self.summary,
+            "findings": [finding.to_dict() for finding in self.findings],
+            "recommendations": list(self.recommendations),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> NodeOptimizationReview:
+        try:
+            score = int(raw.get("score", 0))
+        except (TypeError, ValueError):
+            score = 0
+        return cls(
+            node_id=str(raw.get("node_id", "")).strip(),
+            node_title=str(raw.get("node_title", "")).strip(),
+            score=max(0, min(100, score)),
+            summary=str(raw.get("summary", "")).strip(),
+            findings=[
+                OptimizationFinding.from_dict(item)
+                for item in raw.get("findings", [])
+                if isinstance(item, dict)
+            ],
+            recommendations=[
+                str(item).strip()
+                for item in raw.get("recommendations", [])
+                if str(item).strip()
+            ],
         )
 
 
@@ -156,8 +252,10 @@ class CalibrationReport:
     verdict_reason: str = ""
     must_fix: list[str] = field(default_factory=list)
     summary: str = ""
+    root_cause_category: str = "artifact"
     root_cause: str = ""
     points: list[RejectionPoint] = field(default_factory=list)
+    node_reviews: list[NodeOptimizationReview] = field(default_factory=list)
     skills_used: list[str] = field(default_factory=list)
     skills_missing: list[str] = field(default_factory=list)
     edits: list[ProposedEdit] = field(default_factory=list)
@@ -187,8 +285,10 @@ class CalibrationReport:
             "verdict_reason": self.verdict_reason,
             "must_fix": list(self.must_fix),
             "summary": self.summary,
+            "root_cause_category": self.root_cause_category,
             "root_cause": self.root_cause,
             "points": [point.to_dict() for point in self.points],
+            "node_reviews": [review.to_dict() for review in self.node_reviews],
             "skills_used": list(self.skills_used),
             "skills_missing": list(self.skills_missing),
             "edits": [edit.to_dict() for edit in self.edits],
@@ -208,10 +308,18 @@ class CalibrationReport:
             verdict_reason=str(raw.get("verdict_reason", "")),
             must_fix=[str(item) for item in raw.get("must_fix", [])],
             summary=str(raw.get("summary", "")),
+            root_cause_category=str(
+                raw.get("root_cause_category") or "artifact"
+            ),
             root_cause=str(raw.get("root_cause", "")),
             points=[
                 RejectionPoint.from_dict(item)
                 for item in raw.get("points", [])
+                if isinstance(item, dict)
+            ],
+            node_reviews=[
+                NodeOptimizationReview.from_dict(item)
+                for item in raw.get("node_reviews", [])
                 if isinstance(item, dict)
             ],
             skills_used=[str(item) for item in raw.get("skills_used", [])],
@@ -280,6 +388,14 @@ def parse_report(
         )
     else:
         report.summary = str(payload.get("summary", "")).strip()
+        category = str(
+            payload.get("root_cause_category") or "artifact"
+        ).strip().casefold()
+        report.root_cause_category = (
+            category
+            if category in {"artifact", "agent_strategy", "engine_state", "tool_failure"}
+            else "artifact"
+        )
         report.root_cause = str(payload.get("root_cause", "")).strip()
         detected = [
             str(item) for item in payload.get("skills_used", []) if str(item)
@@ -294,6 +410,12 @@ def parse_report(
             RejectionPoint.from_dict(item)
             for item in payload.get("points", [])
             if isinstance(item, dict)
+        ]
+        report.node_reviews = [
+            NodeOptimizationReview.from_dict(item)
+            for item in payload.get("node_reviews", [])
+            if isinstance(item, dict)
+            and str(item.get("node_id", "")).strip()
         ]
         for item in payload.get("edits", []):
             if not isinstance(item, dict):

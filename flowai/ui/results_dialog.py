@@ -3,11 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QSize, Qt
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QDialogButtonBox,
+    QFrame,
+    QGridLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -16,10 +19,88 @@ from PySide6.QtWidgets import (
 
 from ..workspaces import WorkspaceSession
 from .motion import AnimatedDialog
-from .paths import path_menu
+from .paths import open_file, path_menu
 
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
 THUMBNAIL_HEIGHT = 46
+PREVIEW_SIZE = QSize(420, 280)
+
+
+def _preview_pixmap(path: Path, size: QSize = PREVIEW_SIZE) -> QPixmap:
+    """Decode a bounded preview instead of loading a huge source at full size."""
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    source_size = reader.size()
+    if source_size.isValid():
+        reader.setScaledSize(
+            source_size.scaled(size, Qt.AspectRatioMode.KeepAspectRatio)
+        )
+    image = reader.read()
+    return QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+
+
+class ResultImageGallery(QScrollArea):
+    """Large, directly visible previews for image results."""
+
+    def __init__(
+        self, paths: list[str] | None = None, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.paths: list[str] = []
+        self.previews: list[QLabel] = []
+        self.setObjectName("resultImageGallery")
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setMinimumHeight(220)
+        self.setMaximumHeight(440)
+        self.set_paths(paths or [])
+
+    def set_paths(self, paths: list[str]) -> None:
+        self.paths = [
+            raw
+            for raw in paths
+            if Path(raw).suffix.casefold() in IMAGE_SUFFIXES and Path(raw).is_file()
+        ]
+        self.previews = []
+        content = QWidget()
+        grid = QGridLayout(content)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(12)
+        for index, raw in enumerate(self.paths):
+            path = Path(raw)
+            card = QFrame()
+            card.setObjectName("resultImageCard")
+            card_layout = QVBoxLayout(card)
+            preview = QLabel()
+            preview.setObjectName("resultImagePreview")
+            preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            preview.setMinimumSize(220, 160)
+            preview.setToolTip(raw)
+            preview.setCursor(Qt.CursorShape.PointingHandCursor)
+            pixmap = _preview_pixmap(path)
+            if not pixmap.isNull():
+                preview.setPixmap(pixmap)
+            preview.mouseDoubleClickEvent = (  # type: ignore[method-assign]
+                lambda _event, selected=raw: open_file(selected)
+            )
+            preview.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            preview.customContextMenuRequested.connect(
+                lambda position, selected=raw, widget=preview: path_menu(
+                    selected, widget
+                ).exec(widget.mapToGlobal(position))
+            )
+            caption = QLabel(path.name)
+            caption.setObjectName("mutedLabel")
+            caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            caption.setWordWrap(True)
+            caption.setToolTip(raw)
+            card_layout.addWidget(preview, 1)
+            card_layout.addWidget(caption)
+            grid.addWidget(card, index // 2, index % 2)
+            self.previews.append(preview)
+        grid.setRowStretch((len(self.paths) + 1) // 2, 1)
+        self.setWidget(content)
+        self.setHidden(not self.paths)
 
 
 class ResultsDialog(AnimatedDialog):
@@ -31,10 +112,13 @@ class ResultsDialog(AnimatedDialog):
         super().__init__(parent)
         self.session = session
         self.setWindowTitle(f"Результати — {session.display_name}")
-        self.setMinimumSize(760, 520)
+        self.setMinimumSize(960, 700)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._headline())
+
+        self.gallery = ResultImageGallery()
+        layout.addWidget(self.gallery, 1)
 
         self.files = QTreeWidget()
         self.files.setObjectName("generatedFilesTree")
@@ -88,6 +172,7 @@ class ResultsDialog(AnimatedDialog):
     def _fill(self) -> None:
         self.files.clear()
         paths = self.result_paths()
+        self.gallery.set_paths(paths)
         if not paths:
             empty = QTreeWidgetItem(["Фінальних файлів немає", ""])
             empty.setForeground(0, QColor("#94A3B8"))

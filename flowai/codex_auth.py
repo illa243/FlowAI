@@ -5,6 +5,8 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any
 
+from .codex_process import create_codex
+
 LOGGER = logging.getLogger(__name__)
 FALLBACK_MODELS = ("gpt-5.6-terra", "gpt-5.6-terra-max", "gpt-5.6-flex")
 
@@ -18,7 +20,7 @@ def available_models() -> list[str]:
     try:
         import openai_codex
 
-        with openai_codex.Codex() as codex:
+        with create_codex(codex_module=openai_codex) as codex:
             response = codex.models()
             items = getattr(response, "models", None)
             if items is None:
@@ -203,12 +205,12 @@ def read_codex_user_from_client(
 
 def read_codex_user(*, refresh_token: bool = False) -> CodexUser | None:
     try:
-        from openai_codex import Codex
+        import openai_codex
     except ImportError as exc:
         raise CodexAuthError("Не встановлено офіційний Codex SDK") from exc
 
     try:
-        with Codex() as codex:
+        with create_codex(codex_module=openai_codex) as codex:
             return read_codex_user_from_client(codex, refresh_token=refresh_token)
     except Exception as exc:
         raise CodexAuthError(str(exc)) from exc
@@ -216,12 +218,12 @@ def read_codex_user(*, refresh_token: bool = False) -> CodexUser | None:
 
 def logout_codex_user() -> None:
     try:
-        from openai_codex import Codex
+        import openai_codex
     except ImportError as exc:
         raise CodexAuthError("Не встановлено офіційний Codex SDK") from exc
 
     try:
-        with Codex() as codex:
+        with create_codex(codex_module=openai_codex) as codex:
             codex.logout()
     except Exception as exc:
         raise CodexAuthError(str(exc)) from exc

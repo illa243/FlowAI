@@ -156,7 +156,20 @@ class DraftStore:
         workflow.node(source)
         workflow.node(target)
         edge = FlowEdge.create(source, target, source_port)
-        edge.target_variable = target_variable
+        source_node = workflow.node(source)
+        target_node = workflow.node(target)
+        optimizer_retry = (
+            target_variable == "input"
+            and source_node.kind == "calibrator"
+            and target_node.kind == "executor"
+        )
+        edge.target_variable = (
+            "prompt"
+            if optimizer_retry
+            else target_variable
+        )
+        if optimizer_retry:
+            edge.source_path = "data.retry_context"
         workflow.edges.append(edge)
         return edge.id
 

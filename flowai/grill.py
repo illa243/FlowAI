@@ -29,6 +29,14 @@ INSTRUCTIONS = (
     "Не питай те, на що вже є відповідь у завданнях або в історії розмови. "
     "Коли інформації достатньо, поверни done=true."
 )
+REVIEW_FEEDBACK_INSTRUCTIONS = (
+    "Ти допомагаєш користувачу сформулювати правки після QA-перевірки. "
+    "QA-вердикт є вихідним матеріалом, а власні вказівки користувача мають "
+    "найвищий пріоритет. Став РІВНО ОДНЕ питання за раз і не перепитуй те, "
+    "що вже однозначно сформульовано. Кожне питання супроводжуй 2-4 "
+    "конкретними варіантами відповіді. Коли правки достатньо чіткі для "
+    "виконавчої ноди, поверни done=true."
+)
 
 QUESTION_SCHEMA = {
     "done": False,
@@ -41,6 +49,10 @@ SUMMARY_SCHEMA = {
     "summary": "string",
     "tasks": {"id завдання": "новий промпт"},
     "entry": "string",
+}
+REVIEW_FEEDBACK_SCHEMA = {
+    "summary": "короткий підсумок домовленостей",
+    "feedback": "остаточна самодостатня інструкція для виконавчої ноди",
 }
 
 
@@ -56,6 +68,7 @@ class GrillOutcome:
     summary: str = ""
     rewritten_tasks: dict[str, str] = field(default_factory=dict)
     rewritten_entry: str = ""
+    feedback: str = ""
 
 
 class GrillSession:
@@ -70,6 +83,7 @@ class GrillSession:
         reasoning_effort: str = "medium",
         calibration: Any | None = None,
         generated_files: list[str] | None = None,
+        review_feedback: dict[str, Any] | None = None,
     ) -> None:
         self.workflow = workflow
         self.codex = codex
@@ -78,6 +92,7 @@ class GrillSession:
         self.reasoning_effort = reasoning_effort
         self.calibration = calibration
         self.generated_files = [str(path) for path in generated_files or []]
+        self.review_feedback = dict(review_feedback or {})
         self.history: list[tuple[str, str]] = []
         self._thread_id = ""
         self._done = False
@@ -98,6 +113,12 @@ class GrillSession:
                 if key and key not in seen and path.is_file():
                     paths.append(path)
                     seen.add(key)
+        for value in self.generated_files:
+            path = Path(value).expanduser()
+            key = str(path)
+            if key and key not in seen and path.is_file():
+                paths.append(path)
+                seen.add(key)
         return paths
 
     @staticmethod
@@ -184,10 +205,72 @@ class GrillSession:
             )
         return "\n".join(lines)
 
+    def _review_feedback_text(self) -> str:
+        if not self.review_feedback:
+            return ""
+        review = self.review_feedback
+        verdict = "TRUE" if bool(review.get("verdict")) else "FALSE"
+        lines = [
+            "# QA-перевірка поточного результату",
+            f"Нода: {review.get('node_title', 'Result')}",
+            f"Вердикт: {verdict}",
+        ]
+        score = review.get("score")
+        if score is not None and score != "":
+            lines.append(f"Оцінка: {score}")
+        reason = str(review.get("reason") or "").strip()
+        if reason:
+            lines.append(f"Причина: {reason}")
+        must_fix = review.get("must_fix")
+        if isinstance(must_fix, list) and must_fix:
+            lines.extend(
+                ["Обов'язкові правки QA:"]
+                + [f"- {item}" for item in must_fix if str(item).strip()]
+            )
+        candidate = str(review.get("candidate_path") or "").strip()
+        if candidate:
+            lines.append(f"Файл результату: {candidate}")
+        user_note = str(review.get("user_note") or "").strip()
+        if user_note:
+            lines.extend(
+                [
+                    "",
+                    "# Попередні правки користувача — обов'язкові",
+                    user_note,
+                ]
+            )
+        requirements = review.get("user_requirements")
+        if isinstance(requirements, list) and requirements:
+            lines.extend(
+                [
+                    "",
+                    "# Уже ухвалені рішення користувача — не переглядати",
+                    *(
+                        f"- {item}"
+                        for item in requirements
+                        if str(item).strip()
+                    ),
+                ]
+            )
+        transcript = review.get("grill_transcript")
+        if isinstance(transcript, list) and transcript:
+            lines.extend(["", "# Попередня розмова GrillMe — не втрачати"])
+            for item in transcript:
+                if not isinstance(item, dict):
+                    continue
+                question = str(item.get("question") or "").strip()
+                answer = str(item.get("answer") or "").strip()
+                if question or answer:
+                    lines.append(f"- Питання: {question}\n  Відповідь: {answer}")
+        return "\n".join(lines)
+
     def _ask(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+        instructions = (
+            REVIEW_FEEDBACK_INSTRUCTIONS if self.review_feedback else INSTRUCTIONS
+        )
         run = self.codex.run_agent(
             prompt=prompt,
-            developer_instructions=INSTRUCTIONS
+            developer_instructions=instructions
             + "\n\nВідповідай лише JSON за схемою:\n"
             + json.dumps(schema, ensure_ascii=False, indent=2),
             model=self.model,
@@ -217,6 +300,7 @@ class GrillSession:
         prompt = (
             f"{self._flow_context()}\n\n"
             f"{self._calibration_text()}\n\n"
+            f"{self._review_feedback_text()}\n\n"
             f"# Що вже з'ясовано\n{self._history_text()}\n\n"
             "Постав наступне питання або поверни done=true."
         )
@@ -247,6 +331,22 @@ class GrillSession:
         self._last_question = ""
 
     def finish(self) -> GrillOutcome:
+        if self.review_feedback:
+            prompt = (
+                f"{self._flow_context()}\n\n"
+                f"{self._review_feedback_text()}\n\n"
+                f"# Домовленості з користувачем\n{self._history_text()}\n\n"
+                "Сформуй остаточні правки для ноди, яка отримає результат "
+                "гілки FALSE. Не змінюй Flow і не переписуй вихідні промпти. "
+                "Feedback має бути самодостатньою, конкретною інструкцією: "
+                "поєднай QA must_fix, прямі вказівки користувача та рішення з "
+                "обговорення; усунь суперечності на користь користувача."
+            )
+            parsed = self._ask(prompt, REVIEW_FEEDBACK_SCHEMA)
+            return GrillOutcome(
+                summary=str(parsed.get("summary", "")).strip(),
+                feedback=str(parsed.get("feedback", "")).strip(),
+            )
         demand = ""
         if self.calibration is not None:
             demand = (
@@ -254,9 +354,7 @@ class GrillSession:
                 "обов'язково — саме воно не пройшло перевірку. Решту завдань "
                 "чіпай лише тоді, коли домовленості справді їх стосуються.\n"
             )
-            if any(
-                FRESH_START_MARKER in answer for _question, answer in self.history
-            ):
+            if any(FRESH_START_MARKER in answer for _question, answer in self.history):
                 demand += (
                     "Користувач вирішив почати спочатку: у промпті має бути "
                     "явна вказівка не спиратись на вже створені файли, "
