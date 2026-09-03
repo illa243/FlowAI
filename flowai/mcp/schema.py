@@ -14,8 +14,10 @@ DESCRIPTIONS: dict[str, str] = {
     "prompt_reviewer": "Агент, який уточнює промпт перед виконанням.",
     "executor": "Агент, який виконує задачу і створює файли.",
     "task_reviewer": (
-        "Агент-контролер. Має повертати JSON із полем verdict — саме на нього "
-        "спирається розгалуження блока Result."
+        "Агент-контролер. Повертає узгоджений JSON із verdict і score. "
+        "TRUE потребує оцінки не нижче pass_threshold, порожнього must_fix, "
+        "відсутності blocking issues і failed checks. Після невдалих виправлень "
+        "JSON Flow очікує рішення користувача з типом invalid_qa_contract."
     ),
     "result": (
         "Розгалуження. TRUE — робота прийнята, FALSE — на переробку, "
@@ -26,8 +28,9 @@ DESCRIPTIONS: dict[str, str] = {
         "Аналітик протоколу роботи. Не має портів і не бере участі в маршруті."
     ),
     "calibrator": (
-        "Зупиняє Flow після K-го FALSE, продовжує тред Task Reviewer і "
-        "готує пояснення та конкретні правки. Вихідних портів немає."
+        "Аналізує невдалу спробу після K-го FALSE та пропонує правки "
+        "вибраних нод. Маршрут: Result.FALSE → Calibration Stop → Executor. "
+        "Вихід out передає retry_context; auto_skip пропускає аналіз."
     ),
 }
 
@@ -35,7 +38,7 @@ CONFIG_HINTS: dict[str, dict[str, str]] = {
     "calibrator": {
         "false_threshold": (
             "Після якого за рахунком FALSE зупинити Flow і показати "
-            "рекомендації. За замовчуванням 1."
+            "рекомендації. За замовчуванням 2."
         ),
         "skills": (
             "Скіли, закріплені за нодою: список {name, path}. Codex "

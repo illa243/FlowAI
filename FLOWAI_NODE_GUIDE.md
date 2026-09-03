@@ -5,16 +5,20 @@
 [`DOCUMENTATION.md`](DOCUMENTATION.md), а готовий базовий приклад — у
 [`examples/review_loop.flowai.json`](examples/review_loop.flowai.json).
 
+Звірено з кодом 3 вересня 2026 року: пакет 0.4.0, формат 2, вісім типів нод.
+
 ## Головні правила
 
 1. Поточний `format_version` — `2`.
 2. Ідентифікатори нод і зв’язків мають бути непорожніми та унікальними.
-3. Звичайна нода має вихід `out`; `Result` має `true` і `false`; `Tasks Manager`
+3. Звичайна нода має вихід `out`; `Result` має `true`, `false` і `exhausted`; `Tasks Manager`
    має `next` і `done`; `Work Reviewer` не має портів.
 4. Зворотний зв’язок дозволений лише з `Result`:
    - `Result: false` повертає невдалу роботу на переробку;
    - `Result: true` повертається до `Tasks Manager`, щоб завершити поточне
      завдання й отримати наступне.
+   - `Result: exhausted` повертається до `Tasks Manager`, щоб зафіксувати
+     невдачу активного завдання та перейти до наступного.
 5. Перед кожним `Result` у висхідному ланцюжку має бути `Task Reviewer`, інакше
    `Result` не матиме надійного вердикту.
 6. **QA — обов’язковий шлюз, а не паралельна гілка.** Якщо результат ноди
@@ -100,7 +104,7 @@ FlowAI можуть використовувати їх для стану або
 }
 ```
 
-- `source_port` — `out`, `true`, `false`, `next` або `done` залежно від ноди.
+- `source_port` — `out`, `true`, `false`, `exhausted`, `next` або `done` залежно від ноди.
 - `source_path` — що взяти з `NodeResult`: `$`, `text`, `data`,
   `data.improved_prompt`, `data.retry_context` тощо.
 - `target_variable` — ім’я у `inputs` наступної ноди, наприклад `prompt`, `work`,
@@ -311,7 +315,9 @@ Prompt Reviewer автоматично бере `task.prompt` або `data.promp
   "score": 100,
   "candidate_path": "C:/absolute/path/result.png",
   "reason": "Чому робота прийнята або відхилена",
-  "must_fix": []
+  "must_fix": [],
+  "issues": [],
+  "checks": []
 }
 ```
 
@@ -324,6 +330,24 @@ Prompt Reviewer автоматично бере `task.prompt` або `data.promp
 `sandbox: "read-only"` означає, що рев’ювер не змінює файли, але його текстовий
 JSON-вердикт усе одно передається наступній ноді через Flow. Read-only обмежує
 файлові операції агента, а не обмін даними між блоками.
+
+Нові ноди мають `strict_review_contract: true`, `pass_threshold: 80` та
+`qa_correction_attempts: 1`. `verdict` має бути boolean, `score` — цілим 0–100.
+TRUE дозволено лише за оцінки не нижче порога, без `must_fix`, failed checks
+і blocking issues. FALSE потребує issue або `system_error`; старі
+`reason`/`must_fix` нормалізуються для сумісності.
+
+Issue є блокувальним за severity `blocking|blocker|critical|error` **або** за
+category `missing_requirement|technical_blocker|visual_mismatch`. Ці категорії
+блокують приймання навіть із `severity: "warning"` чи `"info"`. Не змінюйте
+категорію реального дефекту лише заради TRUE. Необов'язкову пораду можна
+описати в `reason`, якщо вона не є порушенням вимог.
+
+Після вичерпання виправлень JSON Runner створює `invalid_qa_contract`,
+зберігаючи поточну QA-ноду й її входи в checkpoint. UI показує помилки та
+фрагмент відповіді. **Повторити QA** надсилає `retry_task` із поясненням,
+а не приймає некоректний verdict. X/Esc зберігає паузу; **Зупинити Flow**
+залишає прогрес для продовження.
 
 ### Result (`result`)
 
@@ -379,6 +403,26 @@ PSD QA — `true`. Тоді вибір концепту або Synthesis PNG н�
 автоматично переходить до наступного. Без ребра `EXHAUSTED` лишається діалог
 додавання спроб.
 
+### Calibration Stop (`calibrator`)
+
+**Колір:** `#E11D48`. **Входи:** лише вихід FALSE блока Result.
+**Вихід:** `out`, який з'єднується з Executor і передає `data.retry_context`
+у його змінну `prompt`. Пряме ребро Result.FALSE → Executor у такому маршруті
+не допускається.
+
+Після K-го відхилення аналізує невдалий прохід перед повторним виконавцем.
+З `memory: fresh` аналіз працює в незалежному Codex-треді.
+
+| Поле | Що робить |
+|---|---|
+| `false_threshold` | Після якого FALSE зупинятись. За замовчуванням 2 |
+| `auto_skip` | Повністю пропускає модель, звіт та intervention; за замовчуванням `false` |
+| `reviewed_nodes` | ID нод, для яких створюються окремі `node_reviews` і секції правок |
+| `skills` | Скіли, закріплені за нодою: `[{'name': ..., 'path': ...}]` |
+| `thread_source` | id ноди, чий тред продовжується; рушій заповнює сам |
+
+Повний опис — у [guides/calibration.md](guides/calibration.md).
+
 ### Work Reviewer (`work_reviewer`)
 
 Призначення: записати Markdown-протокол проходів і після завершення Flow оцінити
@@ -408,8 +452,9 @@ Photoshop переводить Flow у `Pause · Attention`, не створюю
 
 ## Спільні параметри агентів
 
-Ці поля застосовуються до `Prompt Reviewer`, `Task Executor`, `Task Reviewer` і
-`Work Reviewer`:
+Спільні агентські поля доступні `Prompt Reviewer`, `Task Executor`,
+`Task Reviewer`, `Calibration Stop` і `Work Reviewer`; спеціалізовані блоки
+можуть додавати власні інструкції й особливості виконання:
 
 - `model` — модель Codex;
 - `reasoning_effort` — `none`, `low`, `medium`, `high`, `xhigh` або `max`;
@@ -418,12 +463,12 @@ Photoshop переводить Flow у `Pause · Attention`, не створюю
 - `prompt` — шаблон запиту;
 - `prompt_source` — `template` або `input`;
 - `sandbox` — `read-only`, `workspace-write` або `full-access`;
-- `workspace` — окрема робоча папка ноди;
+- `workspace` — додаткове джерело ноди; для збереженого Flow тека запису
+  залишається папкою його `.flowai.json`;
 - `additional_folders` — додаткові доступні папки;
 - `output_format` — `text` або `json`;
 - `output_schema` — схема очікуваної JSON-відповіді;
 - `attachments` — постійні вкладення ноди;
-- `timeout_seconds` — граничний час одного запиту;
 - `retries` — повтори лише після технічної помилки, не після негативного рев’ю;
 - `memory` — `thread`, `fresh` або `task_thread`; останній ізолює контекст за
   `task_id`, але зберігає потрібну історію retry поточного Task;
@@ -435,6 +480,16 @@ Photoshop переводить Flow у `Pause · Attention`, не створюю
 - `operation_intent_required` — перед ітеративним Python-скриптом перевірити
   target check, outputs, metric і budget проти retry contract.
 
+`timeout_seconds` вилучено з конфігурації: він не обмежує час SDK-запиту.
+Не додавайте його в нові Flow. Повтори після технічної помилки, виправлення
+JSON QA та цикл FALSE мають різні лічильники й призначення.
+
+`instruction_files` читаються відносно теки Flow або за абсолютним шляхом.
+Вони повинні існувати та мати формат `.md`/`.markdown`. Не дублюйте один
+`SKILL.md` одночасно в skills і MD-інструкціях. Підключення інструкцій не
+встановлює потрібні skill інструменти; для досліджень дивіться
+[Deep research](guides/deep-research.md).
+
 На Windows усі внутрішні запуски Codex app-server — перший старт, транспортний
 restart, login, logout, читання акаунта та списку моделей — проходять через
 централізований launcher із `CREATE_NO_WINDOW`, `STARTF_USESHOWWINDOW` і
@@ -444,7 +499,7 @@ PAUSE, STOP або очищення дерева процесів через Job
 Найменші необхідні права:
 
 - `read-only` — аналіз і QA без зміни файлів;
-- `workspace-write` — генерація та редагування у робочих папках;
+- `workspace-write` — генерація та редагування у теці Flow-проєкту;
 - `full-access` — лише коли агенту справді потрібні дії поза дозволеними папками.
 
 ## Рекомендовані схеми
@@ -484,11 +539,14 @@ Result.FALSE       → Task Executor для виправлення поточн�
 Tasks Manager.next.data → Prompt Reviewer: input
 Prompt Reviewer.data.improved_prompt → Task Executor: prompt
 Task Executor.data → Task Reviewer: work
-Tasks Manager.next.data.prompt → Task Reviewer: criteria
 Task Reviewer.data → Result: review
 Result.false.data.retry_context → Task Executor: prompt
 Result.true.data → Tasks Manager: input
 ```
+
+Для критеріїв установіть `Task Reviewer.criteria_node` у ID Prompt Reviewer
+або Tasks Manager. Не додавайте окреме ребро менеджера до QA лише для критеріїв:
+воно може поставити QA в чергу до готовності роботи виконавця.
 
 Повернення `Result.true` до менеджера є сигналом завершення активного завдання.
 Не повертайте до менеджера `false`: воно має залишити активним те саме завдання й
@@ -569,29 +627,16 @@ Entry/Tasks Manager → Generator → Visual QA (Task Reviewer) → Result
    зв’язків. Не покладайтеся лише на згадку файла у тексті.
 5. Для кожної задачі сформулюйте перевірюваний результат: шлях файла, формат,
    критерії прийняття й те, що змінювати заборонено.
-6. Після редагування завантажте JSON через `Workflow.load()` і виконайте
-   `validate()`. За наявності коду також запустіть тести проєкту.
-# Calibration Stop
-
-**Колір:** `#E11D48`. **Входи:** лише вихід FALSE блока Result.
-**Вихід:** `out`, який з'єднується з Executor і передає `data.retry_context`
-у його змінну `prompt`. Пряме ребро Result.FALSE → Executor у такому маршруті
-не допускається.
-
-Після K-го відхилення аналізує невдалий прохід перед повторним виконавцем.
-З `memory: fresh` аналіз працює в незалежному Codex-треді.
-
-| Поле | Що робить |
-|---|---|
-| `false_threshold` | Після якого FALSE зупинятись. За замовчуванням 2 |
-| `auto_skip` | Повністю пропускає модель, звіт та intervention; за замовчуванням `false` |
-| `reviewed_nodes` | ID нод, для яких створюються окремі `node_reviews` і секції правок |
-| `skills` | Скіли, закріплені за нодою: `[{'name': ..., 'path': ...}]` |
-| `thread_source` | id ноди, чий тред продовжується; рушій заповнює сам |
-
-Повний опис — у `guides/calibration.md`.
-
+6. Після редагування завантажте JSON через
+   `flowai.persistence.load_workflow(Path(...))` і виконайте
+   `workflow.validate()`. Порожній список означає успішну перевірку графа;
+   доступність інструментів та якість результату перевіряються окремо.
 ## Поле «Скіли» в агентських блоках
 
 Будь-який блок-агент може мати закріплені скіли. Вони передаються Codex як
 `SkillInput` і завантажуються до першого кроку агента.
+
+Локальний список FlowAI сканує `%USERPROFILE%/.codex/skills` та `.system`.
+Plugin-skills з інших кешів можуть бути відсутні у цьому списку. Наявний
+`SKILL.md` можна підключити через `instruction_files`; він не додає відсутні
+інструменти чи права доступу автоматично.
