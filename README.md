@@ -1,5 +1,9 @@
 # FlowAI
 
+[English](README.en.md) · **Українська**
+
+**Visual workflows for Codex: tasks → execution → QA → results.**
+
 **Візуальні Workflow для Codex: завдання → виконання → QA → результат.**
 
 FlowAI — настільна програма для Windows, у якій можна збирати й запускати
